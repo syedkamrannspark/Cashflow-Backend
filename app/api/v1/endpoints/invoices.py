@@ -7,7 +7,7 @@ from app.schemas.dashboard import Invoice, InvoiceResponse
 
 router = APIRouter()
 
-@router.get("/", response_model=InvoiceResponse)
+@router.get("", response_model=InvoiceResponse)
 def read_invoices(
     db: Session = Depends(get_db), 
     skip: int = 0, 

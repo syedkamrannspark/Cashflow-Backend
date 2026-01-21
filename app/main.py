@@ -17,6 +17,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Trust forwarded headers from Vercel/Nginx to properly handle HTTPS redirects
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
+
 from app.api.v1.router import api_router
 app.include_router(api_router, prefix="/api/v1")
 
