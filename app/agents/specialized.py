@@ -1,7 +1,7 @@
 from typing import Any, Dict, List
 from app.agents.base import Agent
 from app.core.database import SessionLocal
-from app.models import PaymentHistory, BankTransaction
+from app.models import PaymentHistory, BankTransaction, AppInvoice, ForecastMetric
 from sqlalchemy import text
 from datetime import datetime
 import textwrap
@@ -11,8 +11,10 @@ class Sensor(Agent):
         super().__init__(name="Sensor", role="Data Collection")
 
     def process(self, input_data: Any) -> Dict[str, Any]:
-        # input_data is likely the user prompt or parsed requirements
+        # input_data contains the user prompt and other context
+        prompt = input_data.get("prompt", "")
         # For simplicity, we fetch recent data from PaymentHistory and BankTransaction
+        # In a more advanced version, we could use the prompt to filter what data we fetch.
         
         db = SessionLocal()
         try:
@@ -38,16 +40,43 @@ class Sensor(Agent):
                 }
                 for t in transactions
             ]
+
+            # Fetch recent invoices
+            invoices = db.query(AppInvoice).limit(20).all()
+            invoice_summary = [
+                {
+                    "invoice_number": i.invoice_number,
+                    "customer": i.customer_name,
+                    "amount": i.total_amount,
+                    "due_date": str(i.due_date),
+                    "status": i.status
+                }
+                for i in invoices
+            ]
+
+            # Fetch forecast metrics
+            metrics_data = db.query(ForecastMetric).limit(20).all()
+            metrics_summary = [
+                {
+                    "category": m.category,
+                    "metric": m.metric_name,
+                    "value": m.value_raw,
+                    "period": m.period
+                }
+                for m in metrics_data
+            ]
             
             return {
                 "status": "success",
                 "message": "Data collection completed successfully.",
                 "data": {
                     "payments": payment_summary,
-                    "transactions": transaction_summary
+                    "transactions": transaction_summary,
+                    "invoices": invoice_summary,
+                    "metrics": metrics_summary
                 },
                 "metrics": [
-                    {"label": "Records Fetched", "value": str(len(payments) + len(transactions))},
+                    {"label": "Records Fetched", "value": str(len(payments) + len(transactions) + len(invoices) + len(metrics_data))},
                     {"label": "Sources", "value": "Database"}
                 ]
             }
@@ -61,21 +90,36 @@ class Analyzer(Agent):
         super().__init__(name="Analyzer", role="Data Analysis")
 
     def process(self, input_data: Any) -> Dict[str, Any]:
-        # input_data should contain the data from Sensor
+        # input_data should contain the data from Sensor and the user prompt
         sensor_data = input_data.get("data", {})
+        user_prompt = input_data.get("prompt", "Analyze the financial data.")
         
         prompt = f"""
-        Analyze the following financial data and provide a cash flow forecast summary or insights.
+        You are a generic Financial Analyst Agent.
+        Your goal is to answer the User's Request strictly based on the provided Financial Data.
         
-        Payments: {sensor_data.get('payments', [])[:5]} ... (truncated)
-        Transactions: {sensor_data.get('transactions', [])[:5]} ... (truncated)
+        User Request: "{user_prompt}"
         
-        Provide:
-        1. Key trends
-        2. Potential risks
-        3. Simple forecast (next 30 days)
+        --- AVAILABLE FINANCIAL DATA ---
         
-        Format the output as a clean, professional financial summary. Do NOT use JSON. Use Markdown headings and bullet points.
+        Recent Payments (Last 20):
+        {sensor_data.get('payments', [])}
+        
+        Recent Bank Transactions (Last 20):
+        {sensor_data.get('transactions', [])}
+
+        Open Invoices (Last 20):
+        {sensor_data.get('invoices', [])}
+
+        Forecast Metrics (Last 20):
+        {sensor_data.get('metrics', [])}
+        
+        --- INSTRUCTIONS ---
+        1. Analyze the provided data to answer the User Request.
+        2. If the data suggests an answer, provide it clearly with evidence.
+        3. If the data is insufficient to answer the request, state what is missing.
+        4. Do NOT hallucinate data. Only use what is provided above.
+        5. Format your response in clean Markdown (no JSON).
         """
         
         analysis_text = self.llm.generate(prompt, system_message="You are a simplified financial analyst helper.")
