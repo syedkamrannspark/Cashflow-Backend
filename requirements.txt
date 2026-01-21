@@ -8,3 +8,5 @@ python-dotenv
 requests
 pydantic
 pydantic-settings
+openai
+httpx
