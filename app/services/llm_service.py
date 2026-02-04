@@ -183,3 +183,50 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
     except Exception as e:
         print(f"LLM Error (flow): {e}")
         return []
+
+
+def answer_user_query(query: str, payload_data: dict) -> str:
+    """
+    Answer user queries about their uploaded data and financial information.
+    Uses the provided dataset to answer questions contextually.
+    """
+    if not settings.OPENROUTER_API_KEY:
+        return "AI assistant is not configured. Please add your OpenRouter API key."
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    system_prompt = (
+        "You are a helpful financial assistant. Answer user questions about their cash flow, "
+        "invoices, payment history, and financial data. Use ONLY the provided dataset to answer questions. "
+        "If the user asks about something not in the data, politely explain that you don't have that information. "
+        "Be concise, clear, and provide actionable insights when possible. "
+        "Always base your answer on the actual data provided, do not make assumptions or invent data."
+    )
+
+    user_prompt = (
+        f"User Query: {query}\n\n"
+        f"Here is the financial data available:\n"
+        f"{json.dumps(payload_data, indent=2, default=str)}"
+    )
+
+    payload = {
+        "model": "openai/gpt-3.5-turbo",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.7,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=45)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"LLM Error (query): {e}")
+        return "Sorry, I encountered an error processing your question. Please try again later."

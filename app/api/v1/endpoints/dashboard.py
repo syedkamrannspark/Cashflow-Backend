@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List
+from typing import List, Dict, Any, Optional
 from app.core.database import get_db
 from app.models.invoice import AppInvoice
 from app.models.payment_history import PaymentHistory
@@ -10,9 +10,12 @@ from app.models.complex_models import ForecastMetric
 from app.schemas.dashboard import CashPosition, ChartDataPoint, CashFlowDataPoint
 from app.repositories.csv_repository import CSVRepository
 from app.repositories.csv_metadata_repository import CSVMetadataRepository
-from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter
+from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query
 import datetime
 import re
+import hashlib
+import json
+import time
 
 def parse_currency(value: str) -> float:
     if not value or value == 'nan':
@@ -26,6 +29,10 @@ def parse_currency(value: str) -> float:
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Cache configuration
+CACHE_TTL_SECONDS = 300  # 5 minutes cache TTL
+_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def _to_float(value) -> float:
@@ -45,6 +52,43 @@ def _to_int(value) -> int:
         return int(round(_to_float(value)))
     except Exception:
         return 0
+
+
+def _generate_cache_key(dataset: dict) -> str:
+    """
+    Generate a consistent hash key for the dataset to use as cache key.
+    """
+    # Sort keys to ensure consistent ordering
+    serialized = json.dumps(dataset, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _get_cached_response(cache_key: str) -> Optional[Any]:
+    """
+    Retrieve cached response if it exists and hasn't expired.
+    """
+    if cache_key in _cache:
+        cached_entry = _cache[cache_key]
+        if time.time() - cached_entry["timestamp"] < CACHE_TTL_SECONDS:
+            logger.info(f"Cache HIT for key: {cache_key[:16]}...")
+            return cached_entry["data"]
+        else:
+            # Expired, remove from cache
+            del _cache[cache_key]
+            logger.info(f"Cache EXPIRED for key: {cache_key[:16]}...")
+    logger.info(f"Cache MISS for key: {cache_key[:16]}...")
+    return None
+
+
+def _set_cached_response(cache_key: str, data: Any) -> None:
+    """
+    Store response in cache with current timestamp.
+    """
+    _cache[cache_key] = {
+        "data": data,
+        "timestamp": time.time()
+    }
+    logger.info(f"Cache SET for key: {cache_key[:16]}... (total cached items: {len(_cache)})")
 
 
 def _filter_data_by_metadata(full_data: list, metadata: list) -> list:
@@ -128,7 +172,16 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     }
 
     print("/stats dataset:", dataset, flush=True)
-    llm_stats = get_stats_from_openrouter(dataset) or {}
+    
+    # Check cache first
+    cache_key = f"stats_{_generate_cache_key(dataset)}"
+    llm_stats = _get_cached_response(cache_key)
+    
+    if llm_stats is None:
+        # Cache miss - call LLM
+        llm_stats = get_stats_from_openrouter(dataset) or {}
+        _set_cached_response(cache_key, llm_stats)
+    
     logger.info("/stats OpenRouter response: %s", llm_stats)
     print("/stats OpenRouter response:", llm_stats, flush=True)
 
@@ -192,7 +245,15 @@ async def get_cash_forecast(db: Session = Depends(get_db)):
         ]
     }
 
-    llm_points = get_cash_forecast_from_openrouter(dataset)
+    # Check cache first
+    cache_key = f"forecast_{_generate_cache_key(dataset)}"
+    llm_points = _get_cached_response(cache_key)
+    
+    if llm_points is None:
+        # Cache miss - call LLM
+        llm_points = get_cash_forecast_from_openrouter(dataset)
+        _set_cached_response(cache_key, llm_points)
+    
     logger.info("/forecast OpenRouter response: %s", llm_points)
     print("/forecast OpenRouter response:", llm_points, flush=True)
 
@@ -281,7 +342,15 @@ async def get_cash_flow(db: Session = Depends(get_db)):
         ]
     }
 
-    llm_points = get_cash_flow_from_openrouter(dataset)
+    # Check cache first
+    cache_key = f"flow_{_generate_cache_key(dataset)}"
+    llm_points = _get_cached_response(cache_key)
+    
+    if llm_points is None:
+        # Cache miss - call LLM
+        llm_points = get_cash_flow_from_openrouter(dataset)
+        _set_cached_response(cache_key, llm_points)
+    
     logger.info("/flow OpenRouter response: %s", llm_points)
     print("/flow OpenRouter response:", llm_points, flush=True)
 
@@ -299,3 +368,56 @@ async def get_cash_flow(db: Session = Depends(get_db)):
 
     print("/flow API response payload:", [p.model_dump() for p in result], flush=True)
     return result
+
+
+@router.post("/query")
+async def query_data_assistant(query_payload: dict, db: Session = Depends(get_db)):
+    """
+    Answer user queries about their uploaded data using AI.
+    """
+    query = query_payload.get("query", "").strip()
+    
+    if not query:
+        return {"response": "Please enter a valid question."}
+    
+    # Fetch all documents with their data
+    documents = await CSVRepository.list_documents_with_full_data()
+    document_ids = [doc.id for doc in documents]
+    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
+
+    # Build dataset for the LLM
+    dataset = {
+        "documents": [
+            {
+                "id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "full_data": _filter_data_by_metadata(
+                    doc.full_data or [],
+                    [
+                        {
+                            "column_name": meta.column_name,
+                            "data_type": meta.data_type,
+                            "connection_key": meta.connection_key,
+                            "alias": meta.alias,
+                            "description": meta.description,
+                            "is_target": meta.is_target,
+                            "is_helper": meta.is_helper,
+                        }
+                        for meta in metadata_by_doc.get(doc.id, [])
+                    ]
+                ),
+            }
+            for doc in documents
+        ]
+    }
+
+    # Get response from AI
+    response = answer_user_query(query, dataset)
+    
+    logger.info("/query response: %s", response)
+    print("/query response:", response, flush=True)
+    
+    return {"response": response}
