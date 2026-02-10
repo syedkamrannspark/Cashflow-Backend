@@ -1,5 +1,32 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Union
+
+class ChartDataSchema(BaseModel):
+    """Schema for visualization chart data"""
+    type: str  # 'line', 'bar', 'pie', 'area'
+    data: List[Dict[str, Any]]
+    xKey: Optional[str] = None
+    yKey: Optional[Union[str, List[str]]] = None
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    colors: Optional[List[str]] = None
+    insights: Optional[List[str]] = None
+
+class QueryResponse(BaseModel):
+    """Response for user queries with optional chart data"""
+    response: str
+    chartData: Optional[ChartDataSchema] = None
+
+class DetailedBreakdown(BaseModel):
+    key: str
+    value: float
+    label: str
+
+class StatBreakdown(BaseModel):
+    summary: str
+    breakdown: List[DetailedBreakdown]
+    trend: str
+    insights: str
 
 class CashPosition(BaseModel):
     current: float
@@ -9,6 +36,11 @@ class CashPosition(BaseModel):
     currentChangePercent: float
     forecastChangePercent: float
     overdueInvoicesCount: int
+    # Detailed breakdowns for popovers
+    currentBreakdown: Optional[StatBreakdown] = None
+    forecastBreakdown: Optional[StatBreakdown] = None
+    atRiskBreakdown: Optional[StatBreakdown] = None
+    runwayBreakdown: Optional[StatBreakdown] = None
 
 class ChartDataPoint(BaseModel):
     date: str
@@ -17,6 +49,7 @@ class ChartDataPoint(BaseModel):
 
 class CashFlowDataPoint(BaseModel):
     week: str
+    date: str
     inflows: float
     outflows: float
 

@@ -1,23 +1,19 @@
 from openai import OpenAI
-import os
-from dotenv import load_dotenv
 import httpx
-
-load_dotenv()
+from app.core.config import settings
 
 class LLMClient:
     def __init__(self):
-        self.api_key = os.getenv("OPENROUTER_API_KEY")
+        self.api_key = settings.OPENROUTER_API_KEY
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY environment variable not set")
         
         self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
+            base_url=settings.LLM_BASE_URL,
             api_key=self.api_key,
             http_client=httpx.Client(),
         )
-        # Using a reliable model, e.g., handling generic requests
-        self.model = "meta-llama/llama-3.1-8b-instruct" 
+        self.model = settings.LLM_MODEL 
 
     def generate(self, prompt: str, system_message: str = "You are a helpful assistant.") -> str:
         try:
