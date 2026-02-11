@@ -10,7 +10,7 @@ from app.models.complex_models import ForecastMetric
 from app.schemas.dashboard import CashPosition, ChartDataPoint, CashFlowDataPoint, QueryResponse, ChartDataSchema
 from app.repositories.csv_repository import CSVRepository
 from app.repositories.csv_metadata_repository import CSVMetadataRepository
-from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query
+from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query, get_scenario_analysis_from_openrouter
 import datetime
 import re
 import hashlib
@@ -297,27 +297,149 @@ async def get_cash_forecast(db: Session = Depends(get_db)):
     return data_points
 
 @router.get("/insights")
-def get_dashboard_insights(db: Session = Depends(get_db)):
-    # Re-use logic or call function directly if refactored. 
-    # For now, duplicate logic for simplicity or refactor get_dashboard_stats to return object not Response
+async def get_dashboard_insights(db: Session = Depends(get_db)):
+    """
+    Generate AI insights based on uploaded CSV data.
+    Uses data from csv_documents and csv_metadata tables.
+    """
+    # Fetch all documents with full data
+    documents = await CSVRepository.list_documents_with_full_data()
+    document_ids = [doc.id for doc in documents]
+    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
+
+    # Build dataset in the same format as other endpoints
+    dataset = {
+        "documents": [
+            {
+                "id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "full_data": _filter_data_by_metadata(
+                    doc.full_data or [],
+                    [
+                        {
+                            "column_name": meta.column_name,
+                            "data_type": meta.data_type,
+                            "connection_key": meta.connection_key,
+                            "alias": meta.alias,
+                            "description": meta.description,
+                            "is_target": meta.is_target,
+                            "is_helper": meta.is_helper,
+                        }
+                        for meta in metadata_by_doc.get(doc.id, [])
+                    ]
+                ),
+                "metadata": [
+                    {
+                        "column_name": meta.column_name,
+                        "data_type": meta.data_type,
+                        "connection_key": meta.connection_key,
+                        "alias": meta.alias,
+                        "description": meta.description,
+                        "is_target": meta.is_target,
+                        "is_helper": meta.is_helper,
+                    }
+                    for meta in metadata_by_doc.get(doc.id, [])
+                    if meta.is_target or meta.is_helper
+                ],
+            }
+            for doc in documents
+        ]
+    }
+
+    # Build context from uploaded data
+    context_parts = []
+    context_parts.append(f"Total uploaded files: {len(documents)}")
     
-    # 1. At Risk Invoices
-    at_risk_query = db.query(AppInvoice).filter(AppInvoice.days_past_due > 0)
-    at_risk_amount = at_risk_query.with_entities(func.sum(AppInvoice.balance_due)).scalar() or 0
-    at_risk_count = at_risk_query.count()
+    for doc in dataset["documents"]:
+        context_parts.append(f"\nFile: {doc['filename']}")
+        context_parts.append(f"Rows: {doc['row_count']}, Columns: {doc['column_count']}")
+        
+        if doc['metadata']:
+            context_parts.append("Key columns:")
+            for meta in doc['metadata'][:5]:  # Show first 5 metadata columns
+                context_parts.append(f"  - {meta['alias'] or meta['column_name']}: {meta['description']}")
+        
+        # Sample data summary
+        if doc['full_data']:
+            context_parts.append(f"Data sample: {len(doc['full_data'])} records available")
     
-    # 2. Forecast
-    today = datetime.date.today()
-    next_30 = today + datetime.timedelta(days=30)
-    forecast_query = db.query(AppInvoice).filter(
-        AppInvoice.due_date >= today,
-        AppInvoice.due_date <= next_30
-    )
-    forecast_amount = forecast_query.with_entities(func.sum(AppInvoice.balance_due)).scalar() or 0
-    
-    context = f"At Risk Amount: {at_risk_amount}, Overdue Count: {at_risk_count}, 30-Day Collection Forecast: {forecast_amount}"
+    context = "\n".join(context_parts)
     
     return {"insights": get_insights(context)}
+
+
+@router.get("/scenario-analysis")
+async def get_scenario_analysis(db: Session = Depends(get_db)):
+    """
+    Generate AI-powered scenario analysis with optimistic, expected, and pessimistic forecasts
+    based on uploaded CSV data.
+    """
+    # Fetch all documents with full data
+    documents = await CSVRepository.list_documents_with_full_data()
+    document_ids = [doc.id for doc in documents]
+    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
+
+    # Build dataset in the same format as other endpoints
+    dataset = {
+        "documents": [
+            {
+                "id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "full_data": _filter_data_by_metadata(
+                    doc.full_data or [],
+                    [
+                        {
+                            "column_name": meta.column_name,
+                            "data_type": meta.data_type,
+                            "connection_key": meta.connection_key,
+                            "alias": meta.alias,
+                            "description": meta.description,
+                            "is_target": meta.is_target,
+                            "is_helper": meta.is_helper,
+                        }
+                        for meta in metadata_by_doc.get(doc.id, [])
+                    ]
+                ),
+                "metadata": [
+                    {
+                        "column_name": meta.column_name,
+                        "data_type": meta.data_type,
+                        "connection_key": meta.connection_key,
+                        "alias": meta.alias,
+                        "description": meta.description,
+                        "is_target": meta.is_target,
+                        "is_helper": meta.is_helper,
+                    }
+                    for meta in metadata_by_doc.get(doc.id, [])
+                    if meta.is_target or meta.is_helper
+                ],
+            }
+            for doc in documents
+        ]
+    }
+
+    # Check cache first
+    cache_key = f"scenario_{_generate_cache_key(dataset)}"
+    scenario_points = _get_cached_response(cache_key)
+    
+    if scenario_points is None:
+        # Cache miss - call LLM
+        scenario_points = get_scenario_analysis_from_openrouter(dataset)
+        _set_cached_response(cache_key, scenario_points)
+    
+    logger.info("/scenario-analysis OpenRouter response: %s", scenario_points)
+    print("/scenario-analysis OpenRouter response:", scenario_points, flush=True)
+
+    # Return the scenario analysis points
+    # Format: [{"week": "Week 1", "optimistic": 1150000, "expected": 1000000, "pessimistic": 850000}, ...]
+    return scenario_points
+
 
 @router.get("/flow", response_model=List[CashFlowDataPoint])
 async def get_cash_flow(db: Session = Depends(get_db)):

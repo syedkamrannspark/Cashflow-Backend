@@ -458,3 +458,112 @@ def answer_user_query(query: str, payload_data: dict) -> str:
         print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
         print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
         return "Sorry, I encountered an error processing your question. Please try again later."
+
+
+def get_scenario_analysis_from_openrouter(payload_data: dict) -> list:
+    """
+    Generate scenario analysis with optimistic, expected, and pessimistic forecasts
+    based on uploaded financial data.
+    
+    Returns a list of data points with format:
+    [
+        {"week": "Week 1", "optimistic": 1150000, "expected": 1000000, "pessimistic": 850000},
+        ...
+    ]
+    """
+    if not settings.OPENROUTER_API_KEY:
+        return []
+
+    url = f"{settings.LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    system_prompt = (
+        "You are a financial forecasting expert. Your ONLY job is to return valid JSON. "
+        "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
+        "ONLY return a JSON array and nothing else.\n\n"
+        "Analyze the provided financial data and generate scenario analysis with:\n"
+        "- Optimistic scenario: Best case forecast (15% higher than expected)\n"
+        "- Expected scenario: Most likely forecast based on historical trends\n"
+        "- Pessimistic scenario: Worst case forecast (15% lower than expected)\n\n"
+        "Generate 8 data points representing weekly forecasts.\n"
+        "Each data point must include:\n"
+        "  - week: String label (e.g., 'Week 1', 'Week 2', or actual date if determinable)\n"
+        "  - optimistic: Number representing optimistic cash position\n"
+        "  - expected: Number representing expected cash position\n"
+        "  - pessimistic: Number representing pessimistic cash position\n\n"
+        "Base your forecasts on:\n"
+        "1. Historical cash flow patterns from the data\n"
+        "2. Revenue trends and seasonality\n"
+        "3. Expense patterns and upcoming obligations\n"
+        "4. Current cash position as starting point\n\n"
+        "Return ONLY a JSON array. Do NOT hallucinate data. Base calculations on actual provided data."
+    )
+
+    user_prompt = (
+        "Analyze this financial data and return a JSON array with 8 scenario forecast points:\n\n"
+        f"{json.dumps(payload_data, default=str)}\n\n"
+        "Return ONLY this JSON array structure, no markdown, no code blocks, no explanation:\n"
+        "[\n"
+        '  {"week": "Week 1", "optimistic": <number>, "expected": <number>, "pessimistic": <number>},\n'
+        '  {"week": "Week 2", "optimistic": <number>, "expected": <number>, "pessimistic": <number>},\n'
+        "  ...\n"
+        "]"
+    )
+
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=45)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "choices" not in data or not data["choices"]:
+            print(f"LLM Error (scenario): No choices in response: {data}")
+            raise ValueError("Empty choices in LLM response")
+        
+        content = data["choices"][0]["message"]["content"].strip()
+        
+        if not content:
+            print(f"LLM Error (scenario): Empty content in response")
+            raise ValueError("Empty message content from LLM")
+        
+        # Clean and extract JSON from various formats
+        cleaned_content = _extract_json_from_response(content)
+        parsed = json.loads(cleaned_content)
+        
+        # Validate structure
+        if not isinstance(parsed, list):
+            print(f"LLM Error (scenario): Response is not an array: {type(parsed)}")
+            return []
+        
+        # Ensure each point has required fields
+        validated_points = []
+        for i, point in enumerate(parsed[:8]):  # Limit to 8 points
+            if isinstance(point, dict):
+                validated_points.append({
+                    "week": point.get("week", f"Week {i+1}"),
+                    "optimistic": float(point.get("optimistic", 0)),
+                    "expected": float(point.get("expected", 0)),
+                    "pessimistic": float(point.get("pessimistic", 0)),
+                })
+        
+        return validated_points
+    except json.JSONDecodeError as e:
+        print(f"LLM Error (scenario): JSON parsing failed: {e}")
+        print(f"Raw content: {content if 'content' in locals() else 'N/A'}")
+        return []
+    except Exception as e:
+        print(f"LLM Error (scenario): {e}")
+        print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
+        print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
+        return []
