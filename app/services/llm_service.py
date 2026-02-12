@@ -336,6 +336,145 @@ def get_cash_forecast_from_openrouter(payload_data: dict) -> list:
         print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
         return []
 
+def get_data_visualization_from_openrouter(payload_data: dict) -> dict:
+    """
+    Analyze uploaded data and return structured visualization config with chart data.
+    
+    Returns:
+    {
+        "chartType": "line|bar|area",
+        "title": "Chart title",
+        "xAxisKey": "column name for X axis",
+        "yAxisKeys": ["column1", "column2"],
+        "data": [{xAxisKey: value, column1: value, column2: value}, ...]
+    }
+    """
+    if not settings.OPENROUTER_API_KEY:
+        return {
+            "chartType": "line",
+            "title": "Data Visualization",
+            "xAxisKey": "date",
+            "yAxisKeys": [],
+            "data": []
+        }
+
+    url = f"{settings.LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    system_prompt = (
+        "You are a data visualization expert. Your ONLY job is to return valid JSON. "
+        "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
+        "ONLY return a JSON object and nothing else.\n\n"
+        "Analyze the provided dataset including CSV documents and their metadata to create the best visualization:\n\n"
+        "STEP 1 - Understand the Data:\n"
+        "- Review metadata descriptions, aliases, and column types\n"
+        "- Prioritize columns marked as 'is_target: true' for Y-axis (main metrics)\n"
+        "- Use 'is_helper: true' columns for X-axis or additional context\n"
+        "- Read column aliases (user-friendly names) for better labels\n"
+        "- Understand data types (numeric, date, categorical)\n\n"
+        "STEP 2 - Choose Chart Type Based on Data Nature:\n"
+        "- 'line': For time-series data, continuous trends, temporal patterns (dates on X-axis)\n"
+        "- 'bar': For categorical comparisons, discrete categories, rankings (categories on X-axis)\n"
+        "- 'area': For cumulative values, volume over time, showing magnitude (dates on X-axis)\n\n"
+        "STEP 3 - Generate Descriptive Title:\n"
+        "- Create a meaningful title that describes what the chart shows\n"
+        "- Use column aliases/descriptions from metadata for clarity\n"
+        "- Format: '[Metric Name(s)] over [Time Period]' or '[Metric Name(s)] by [Category]'\n"
+        "- Example: 'Revenue and Expenses Over Time' or 'Sales by Product Category'\n\n"
+        "STEP 4 - Select Axes:\n"
+        "- X-axis: Date/time columns (for trends) or categorical columns (for comparisons)\n"
+        "- Y-axis: Numeric target columns (prioritize is_target=true)\n"
+        "- Use column aliases for better readability\n\n"
+        "Return ONLY valid JSON. Sample up to 50 rows for visualization. Base ALL decisions on the actual data and metadata provided."
+    )
+
+    user_prompt = (
+        "Analyze this uploaded financial data with its metadata and return a chart configuration.\n\n"
+        "Dataset structure:\n"
+        "- documents: Array of CSV files with full_data (filtered rows)\n"
+        "- metadata: Column definitions with aliases, descriptions, data_types, is_target, is_helper flags\n\n"
+        f"Data:\n{json.dumps(payload_data, default=str)}\n\n"
+        "IMPORTANT INSTRUCTIONS:\n"
+        "1. Use metadata descriptions and aliases to understand what each column represents\n"
+        "2. Prioritize 'is_target: true' columns for Y-axis (these are key metrics)\n"
+        "3. Choose chart type based on data patterns (temporal → line, categorical → bar, cumulative → area)\n"
+        "4. Generate a descriptive title using column aliases/descriptions\n"
+        "5. Use actual column names in xAxisKey and yAxisKeys (not aliases)\n\n"
+        "Return ONLY this JSON structure, no markdown, no code blocks, no explanation:\n"
+        "{\n"
+        '  "chartType": "line|bar|area",\n'
+        '  "title": "Descriptive chart title based on metadata and data content",\n'
+        '  "xAxisKey": "actual_column_name_for_x_axis",\n'
+        '  "yAxisKeys": ["actual_numeric_column1", "actual_numeric_column2"],\n'
+        '  "data": [\n'
+        '    {"actual_column_name_for_x_axis": "value", "actual_numeric_column1": 123, "actual_numeric_column2": 456},\n'
+        '    ...\n'
+        '  ]\n'
+        "}"
+    )
+
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "choices" not in data or not data["choices"]:
+            print(f"LLM Error (visualization): No choices in response: {data}")
+            raise ValueError("Empty choices in LLM response")
+        
+        content = data["choices"][0]["message"]["content"].strip()
+        
+        if not content:
+            print(f"LLM Error (visualization): Empty content in response")
+            raise ValueError("Empty message content from LLM")
+        
+        # Clean and extract JSON
+        cleaned_content = _extract_json_from_response(content)
+        parsed = json.loads(cleaned_content)
+        
+        # Validate and return structure
+        result = {
+            "chartType": parsed.get("chartType", "line"),
+            "title": parsed.get("title", "Data Visualization"),
+            "xAxisKey": parsed.get("xAxisKey", "date"),
+            "yAxisKeys": parsed.get("yAxisKeys", []),
+            "data": parsed.get("data", [])
+        }
+        
+        return result
+    except json.JSONDecodeError as e:
+        print(f"LLM Error (visualization): JSON parsing failed: {e}")
+        print(f"Raw content: {content if 'content' in locals() else 'N/A'}")
+        return {
+            "chartType": "line",
+            "title": "Data Visualization",
+            "xAxisKey": "date",
+            "yAxisKeys": [],
+            "data": []
+        }
+    except Exception as e:
+        print(f"LLM Error (visualization): {e}")
+        print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
+        print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
+        return {
+            "chartType": "line",
+            "title": "Data Visualization",
+            "xAxisKey": "date",
+            "yAxisKeys": [],
+            "data": []
+        }
 
 def get_cash_flow_from_openrouter(payload_data: dict) -> list:
     if not settings.OPENROUTER_API_KEY:

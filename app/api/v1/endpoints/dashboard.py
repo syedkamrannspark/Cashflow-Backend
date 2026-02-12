@@ -10,7 +10,7 @@ from app.models.complex_models import ForecastMetric
 from app.schemas.dashboard import CashPosition, ChartDataPoint, CashFlowDataPoint, QueryResponse, ChartDataSchema
 from app.repositories.csv_repository import CSVRepository
 from app.repositories.csv_metadata_repository import CSVMetadataRepository
-from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query, get_scenario_analysis_from_openrouter
+from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query, get_scenario_analysis_from_openrouter, get_data_visualization_from_openrouter
 import datetime
 import re
 import hashlib
@@ -439,6 +439,74 @@ async def get_scenario_analysis(db: Session = Depends(get_db)):
     # Return the scenario analysis points
     # Format: [{"week": "Week 1", "optimistic": 1150000, "expected": 1000000, "pessimistic": 850000}, ...]
     return scenario_points
+
+
+@router.get("/data-visualization")
+async def get_data_visualization(db: Session = Depends(get_db)):
+    """
+    Generate dynamic chart configuration based on uploaded CSV data.
+    Returns chart type, axis configuration, and formatted data ready for visualization.
+    """
+    # Fetch all documents with full data
+    documents = await CSVRepository.list_documents_with_full_data()
+    document_ids = [doc.id for doc in documents]
+    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
+
+    # Build dataset
+    dataset = {
+        "documents": [
+            {
+                "id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "full_data": _filter_data_by_metadata(
+                    doc.full_data or [],
+                    [
+                        {
+                            "column_name": meta.column_name,
+                            "data_type": meta.data_type,
+                            "connection_key": meta.connection_key,
+                            "alias": meta.alias,
+                            "description": meta.description,
+                            "is_target": meta.is_target,
+                            "is_helper": meta.is_helper,
+                        }
+                        for meta in metadata_by_doc.get(doc.id, [])
+                    ]
+                ),
+                "metadata": [
+                    {
+                        "column_name": meta.column_name,
+                        "data_type": meta.data_type,
+                        "connection_key": meta.connection_key,
+                        "alias": meta.alias,
+                        "description": meta.description,
+                        "is_target": meta.is_target,
+                        "is_helper": meta.is_helper,
+                    }
+                    for meta in metadata_by_doc.get(doc.id, [])
+                    if meta.is_target or meta.is_helper
+                ],
+            }
+            for doc in documents
+        ]
+    }
+
+    # Check cache first
+    cache_key = f"visualization_{_generate_cache_key(dataset)}"
+    viz_config = _get_cached_response(cache_key)
+    
+    if viz_config is None:
+        # Cache miss - call LLM
+        viz_config = get_data_visualization_from_openrouter(dataset)
+        _set_cached_response(cache_key, viz_config)
+    
+    logger.info("/data-visualization OpenRouter response: %s", viz_config)
+    print("/data-visualization OpenRouter response:", viz_config, flush=True)
+
+    return viz_config
 
 
 @router.get("/flow", response_model=List[CashFlowDataPoint])
