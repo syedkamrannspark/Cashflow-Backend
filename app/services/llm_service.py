@@ -706,3 +706,125 @@ def get_scenario_analysis_from_openrouter(payload_data: dict) -> list:
         print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
         print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
         return []
+
+
+def extract_invoices_from_data(payload_data: dict) -> list:
+    """
+    Extract and analyze invoice data from uploaded CSV files.
+    Identifies invoice records and calculates risk scores.
+    
+    Returns a list of invoice objects with format:
+    [{
+        "id": "invoice_id",
+        "customer": "customer_name",
+        "amount": 1000.50,
+        "dueDate": "2026-02-15",
+        "status": "Pending|Overdue|Paid",
+        "riskScore": 0-100,
+        "aiPrediction": "Risk assessment text"
+    }]
+    """
+    if not settings.OPENROUTER_API_KEY:
+        return []
+
+    url = f"{settings.LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    system_prompt = (
+        "You are a financial data extraction expert. Your ONLY job is to return valid JSON. "
+        "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
+        "ONLY return a JSON array and nothing else.\n\n"
+        "Analyze the provided data to extract invoice records:\n"
+        "1. Identify all columns related to invoices (invoice_id, customer_name, amount, due_date, date, status, etc.)\n"
+        "2. Extract all invoice rows from the data\n"
+        "3. Determine invoice status based on available data:\n"
+        "   - 'Paid' if status contains 'paid' or 'complete' or marked as completed\n"
+        "   - 'Overdue' if current date > due_date AND status is not 'Paid'\n"
+        "   - 'Pending' otherwise\n"
+        "4. Calculate risk score (0-100) based on:\n"
+        "   - Days past due (if overdue)\n"
+        "   - Invoice amount relative to typical amounts\n"
+        "   - Status and payment history patterns\n"
+        "5. Generate AI prediction text describing the risk level and reason\n\n"
+        "Return ONLY a JSON array. Do NOT hallucinate data. Use ONLY information present in the provided data.\n"
+        "Return empty array [] if no invoice data is found."
+    )
+
+    user_prompt = (
+        "Extract and analyze all invoice data from this uploaded dataset:\n\n"
+        f"{json.dumps(payload_data, default=str)}\n\n"
+        "Return ONLY a JSON array, no markdown, no code blocks, no explanation:\n"
+        "[\n"
+        '  {\n'
+        '    "id": "invoice_id_value",\n'
+        '    "customer": "customer_name",\n'
+        '    "amount": 1000.50,\n'
+        '    "dueDate": "2026-02-15",\n'
+        '    "status": "Pending|Overdue|Paid",\n'
+        '    "riskScore": 50,\n'
+        '    "aiPrediction": "Risk assessment text"\n'
+        '  },\n'
+        "  ...\n"
+        "]"
+    )
+
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "choices" not in data or not data["choices"]:
+            print(f"LLM Error (invoices): No choices in response: {data}")
+            raise ValueError("Empty choices in LLM response")
+        
+        content = data["choices"][0]["message"]["content"].strip()
+        
+        if not content:
+            print(f"LLM Error (invoices): Empty content in response")
+            raise ValueError("Empty message content from LLM")
+        
+        # Clean and extract JSON
+        cleaned_content = _extract_json_from_response(content)
+        parsed = json.loads(cleaned_content)
+        
+        # Validate structure
+        if not isinstance(parsed, list):
+            print(f"LLM Error (invoices): Response is not an array: {type(parsed)}")
+            return []
+        
+        # Validate and normalize each invoice
+        validated_invoices = []
+        for inv in parsed:
+            if isinstance(inv, dict) and "id" in inv and "customer" in inv:
+                validated_invoices.append({
+                    "id": str(inv.get("id", "")),
+                    "customer": str(inv.get("customer", "")),
+                    "amount": float(inv.get("amount", 0)),
+                    "dueDate": str(inv.get("dueDate", "")),
+                    "status": str(inv.get("status", "Pending")),
+                    "riskScore": int(inv.get("riskScore", 0)),
+                    "aiPrediction": str(inv.get("aiPrediction", ""))
+                })
+        
+        return validated_invoices
+    except json.JSONDecodeError as e:
+        print(f"LLM Error (invoices): JSON parsing failed: {e}")
+        print(f"Raw content: {content if 'content' in locals() else 'N/A'}")
+        return []
+    except Exception as e:
+        print(f"LLM Error (invoices): {e}")
+        print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
+        print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
+        return []
