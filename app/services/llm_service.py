@@ -477,6 +477,11 @@ def get_data_visualization_from_openrouter(payload_data: dict) -> dict:
         }
 
 def get_cash_flow_from_openrouter(payload_data: dict) -> list:
+    """
+    Generate weekly Cash Inflows vs Outflows based on actual dates in CSV data.
+    Extracts date columns from metadata and groups cash flow by weeks found in the data.
+    Returns array of weekly data points with actual dates or week labels.
+    """
     if not settings.OPENROUTER_API_KEY:
         return []
 
@@ -487,18 +492,43 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
     }
 
     system_prompt = (
-        "You are a financial analytics engine. Use ONLY the provided data to create a weekly "
-        "Cash Inflows vs Outflows series for the last 4 weeks. Do not invent or assume missing "
-        "values. If data is insufficient, use 0 for numeric fields. Output must be a JSON array "
-        "of exactly 4 objects with keys: week, date, inflows, outflows. The week values must be 'Week 1' "
-        "through 'Week 4'. The date field should contain the actual date from the data (format YYYY-MM-DD), "
-        "No extra keys, no prose."
+        "You are a financial analytics engine. Analyze the provided CSV data with metadata.\n\n"
+        "TASK: Create a weekly Cash Inflows vs Outflows analysis using ACTUAL DATES from the data.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. IDENTIFY DATE COLUMNS: Look at metadata for columns with data_type='date' or containing 'date'/'time' in the name\n"
+        "2. IDENTIFY INFLOW/OUTFLOW COLUMNS: Look at metadata for columns containing 'inflow', 'income', 'revenue', 'outflow', 'expense', 'cost', 'payment'\n"
+        "3. GROUP BY WEEKS: Sort data by date and group transactions into weekly buckets\n"
+        "4. CALCULATE TOTALS: Sum inflows and outflows for each week\n"
+        "5. USE ACTUAL DATES: For each week, use the actual date range found in the data (format YYYY-MM-DD)\n\n"
+        "OUTPUT FORMAT:\n"
+        "Return a JSON array of objects with this structure:\n"
+        "{\n"
+        '  "week": "Week 1" or a week label derived from dates (e.g., "Jan 15-21"),\n'
+        '  "date": "YYYY-MM-DD" (start date of the week from actual data),\n'
+        '  "inflows": <total inflows for that week as number>,\n'
+        '  "outflows": <total outflows for that week as number>\n'
+        "}\n\n"
+        "CRITICAL RULES:\n"
+        "- Use ONLY data provided in the dataset\n"
+        "- If no date columns exist, create logical week groupings (Week 1, Week 2, etc.)\n"
+        "- If inflow/outflow columns don't exist by that name, infer from column descriptions\n"
+        "- Return 4 weeks maximum\n"
+        "- Do NOT invent or hallucinate data\n"
+        "- Do NOT use markdown code blocks\n"
+        "- Return ONLY the JSON array, no explanation"
     )
 
     user_prompt = (
-        "Generate the Cash Inflows vs Outflows weekly comparison based strictly on the dataset. "
-        "Return only the JSON array described above.\n\n"
-        f"DATASET_JSON:\n{json.dumps(payload_data, default=str)}"
+        "Analyze this financial dataset and generate weekly Cash Inflows vs Outflows using actual dates from the data.\n\n"
+        "Dataset:\n"
+        f"{json.dumps(payload_data, default=str)}\n\n"
+        "Instructions:\n"
+        "1. Scan the metadata to identify date columns and inflow/outflow columns\n"
+        "2. Extract actual dates from the data\n"
+        "3. Group transactions by week based on these dates\n"
+        "4. Sum inflows and outflows for each week\n"
+        "5. Return ONLY the JSON array (4 weeks maximum) with actual dates from the data\n"
+        "6. Use format: {week, date (YYYY-MM-DD), inflows, outflows}"
     )
 
     payload = {
@@ -507,7 +537,7 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0,
+        "temperature": 0.1,
     }
 
     try:
@@ -526,9 +556,22 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
             return []
         
         # Clean markdown formatting if present
-        cleaned_content = _clean_llm_json_response(content)
+        cleaned_content = _extract_json_from_response(content)
         parsed = json.loads(cleaned_content)
-        return parsed if isinstance(parsed, list) else []
+        
+        # Validate the response structure
+        if isinstance(parsed, list):
+            validated_points = []
+            for point in parsed[:4]:  # Limit to 4 weeks
+                if isinstance(point, dict):
+                    validated_points.append({
+                        "week": str(point.get("week", "")),
+                        "date": str(point.get("date", "")),
+                        "inflows": float(point.get("inflows", 0)),
+                        "outflows": float(point.get("outflows", 0))
+                    })
+            return validated_points
+        return []
     except json.JSONDecodeError as e:
         print(f"LLM Error (flow): JSON parsing failed: {e}. Content: {content if 'content' in locals() else 'N/A'}")
         return []
@@ -825,6 +868,135 @@ def extract_invoices_from_data(payload_data: dict) -> list:
         return []
     except Exception as e:
         print(f"LLM Error (invoices): {e}")
+        print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
+        print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
+        return []
+
+
+def get_dynamic_cash_flow_from_openrouter(payload_data: dict, current_balance: float = 0) -> list:
+    """
+    Generate dynamic cash flow forecast data based on uploaded CSV data.
+    Analyzes ONLY the provided data to project future inflows and outflows.
+    Calculates running closing balance from current position.
+    
+    Returns a list of weekly forecast points with format:
+    [{
+        "week": "Week 1",
+        "date": "2026-02-15",
+        "projectedInflows": 50000.00,
+        "projectedOutflows": 30000.00,
+        "closingBalance": 20000.00
+    }]
+    """
+    if not settings.OPENROUTER_API_KEY:
+        return []
+
+    url = f"{settings.LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    system_prompt = (
+        "You are a financial analyst. Your ONLY job is to return valid JSON based STRICTLY on the provided data. "
+        "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
+        "Do NOT hallucinate, invent, or assume ANY data not explicitly provided. "
+        "ONLY return a JSON array and nothing else.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Analyze ONLY the columns and data provided in the dataset\n"
+        "2. Do NOT estimate or calculate values not derivable from the data\n"
+        "3. If data contains inflow/outflow columns, use their actual values or aggregated amounts\n"
+        "4. If no clear inflow/outflow data exists, return empty array []\n"
+        "5. Generate 4 weeks maximum\n"
+        "6. Base all projections on actual data patterns observed, NOT assumptions\n\n"
+        "Data Analysis Process:\n"
+        "- Identify which columns represent inflows (income, revenue, deposits, etc.)\n"
+        "- Identify which columns represent outflows (expenses, payments, withdrawals, etc.)\n"
+        "- Calculate per-period amounts from the ACTUAL data provided\n"
+        "- Detect if there are trends in the data and project based on those trends ONLY\n"
+        "- Use the provided current balance to calculate closing balances"
+    )
+
+    user_prompt = (
+        "Analyze ONLY this financial dataset and generate 4 weeks of cash flow projections.\n"
+        "Current starting balance: ${}\n\n"
+        "Dataset:\n{}\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Examine the data for inflow and outflow amounts\n"
+        "2. Base projections ONLY on patterns found in the provided data\n"
+        "3. Return weekly projections with running closing balance\n"
+        "4. Do NOT add, estimate, or assume any values not in the data\n"
+        "5. If insufficient data to project reliably, return empty array []\n\n"
+        "Return ONLY this JSON array structure, no markdown, no explanations:\n"
+        "[\n"
+        '  {{\n'
+        '    "week": "Week 1",\n'
+        '    "date": "2026-02-15",\n'
+        '    "projectedInflows": <number_from_data>,\n'
+        '    "projectedOutflows": <number_from_data>,\n'
+        '    "closingBalance": <calculated_balance>\n'
+        '  }},\n'
+        "  ...\n"
+        "]"
+    ).format(current_balance, json.dumps(payload_data, default=str))
+
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "choices" not in data or not data["choices"]:
+            print(f"LLM Error (cash_flow): No choices in response: {data}")
+            raise ValueError("Empty choices in LLM response")
+        
+        content = data["choices"][0]["message"]["content"].strip()
+        
+        if not content:
+            print(f"LLM Error (cash_flow): Empty content in response")
+            raise ValueError("Empty message content from LLM")
+        
+        # Clean and extract JSON
+        cleaned_content = _extract_json_from_response(content)
+        parsed = json.loads(cleaned_content)
+        
+        # Validate structure
+        if not isinstance(parsed, list):
+            print(f"LLM Error (cash_flow): Response is not an array: {type(parsed)}")
+            return []
+        
+        # Validate and normalize each forecast point
+        validated_points = []
+        running_balance = current_balance
+        for point in parsed[:4]:  # Limit to 4 weeks
+            if isinstance(point, dict):
+                inflows = float(point.get("projectedInflows", 0))
+                outflows = float(point.get("projectedOutflows", 0))
+                running_balance += (inflows - outflows)
+                
+                validated_points.append({
+                    "week": str(point.get("week", "")),
+                    "date": str(point.get("date", "")),
+                    "projectedInflows": inflows,
+                    "projectedOutflows": outflows,
+                    "closingBalance": running_balance
+                })
+        
+        return validated_points
+    except json.JSONDecodeError as e:
+        print(f"LLM Error (cash_flow): JSON parsing failed: {e}")
+        print(f"Raw content: {content if 'content' in locals() else 'N/A'}")
+        return []
+    except Exception as e:
+        print(f"LLM Error (cash_flow): {e}")
         print(f"Response status: {response.status_code if 'response' in locals() else 'N/A'}")
         print(f"Response text: {response.text if 'response' in locals() else 'N/A'}")
         return []

@@ -7,10 +7,10 @@ from app.core.database import get_db
 from app.models.invoice import AppInvoice
 from app.models.payment_history import PaymentHistory
 from app.models.complex_models import ForecastMetric
-from app.schemas.dashboard import CashPosition, ChartDataPoint, CashFlowDataPoint, QueryResponse, ChartDataSchema
+from app.schemas.dashboard import CashPosition, ChartDataPoint, CashFlowDataPoint, QueryResponse, ChartDataSchema, ShortfallResponse, ShortfallPeriod
 from app.repositories.csv_repository import CSVRepository
 from app.repositories.csv_metadata_repository import CSVMetadataRepository
-from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query, get_scenario_analysis_from_openrouter, get_data_visualization_from_openrouter
+from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query, get_scenario_analysis_from_openrouter, get_data_visualization_from_openrouter, get_dynamic_cash_flow_from_openrouter
 import datetime
 import re
 import hashlib
@@ -509,8 +509,86 @@ async def get_data_visualization(db: Session = Depends(get_db)):
     return viz_config
 
 
+@router.get("/dynamic-cash-flow")
+async def get_dynamic_cash_flow(db: Session = Depends(get_db)):
+    """
+    Generate dynamic cash flow forecast based on uploaded CSV data.
+    Analyzes patterns in provided data to project inflows, outflows, and closing balance.
+    """
+    # Fetch all documents with full data
+    documents = await CSVRepository.list_documents_with_full_data()
+    document_ids = [doc.id for doc in documents]
+    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
+
+    # Build dataset
+    dataset = {
+        "documents": [
+            {
+                "id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "full_data": _filter_data_by_metadata(
+                    doc.full_data or [],
+                    [
+                        {
+                            "column_name": meta.column_name,
+                            "data_type": meta.data_type,
+                            "connection_key": meta.connection_key,
+                            "alias": meta.alias,
+                            "description": meta.description,
+                            "is_target": meta.is_target,
+                            "is_helper": meta.is_helper,
+                        }
+                        for meta in metadata_by_doc.get(doc.id, [])
+                    ]
+                ),
+                "metadata": [
+                    {
+                        "column_name": meta.column_name,
+                        "data_type": meta.data_type,
+                        "connection_key": meta.connection_key,
+                        "alias": meta.alias,
+                        "description": meta.description,
+                        "is_target": meta.is_target,
+                        "is_helper": meta.is_helper,
+                    }
+                    for meta in metadata_by_doc.get(doc.id, [])
+                    if meta.is_target or meta.is_helper
+                ],
+            }
+            for doc in documents
+        ]
+    }
+
+    # Get current cash position to start balance calculations
+    current_stats = await get_dashboard_stats(db)
+    current_balance = current_stats.current if hasattr(current_stats, 'current') else _to_float(current_stats.get('current', 0)) if isinstance(current_stats, dict) else 0
+
+    # Check cache first (include balance in cache key for accuracy)
+    cache_key = f"dynamic_cash_flow_{_generate_cache_key(dataset)}_{current_balance}"
+    cash_flow_points = _get_cached_response(cache_key)
+    
+    if cash_flow_points is None:
+        # Cache miss - call LLM with current balance
+        cash_flow_points = get_dynamic_cash_flow_from_openrouter(dataset, current_balance)
+        _set_cached_response(cache_key, cash_flow_points)
+    
+    logger.info("/dynamic-cash-flow OpenRouter response: %s", cash_flow_points)
+    print("/dynamic-cash-flow OpenRouter response:", cash_flow_points, flush=True)
+
+    # Return the cash flow forecast points
+    return cash_flow_points
+
+
 @router.get("/flow", response_model=List[CashFlowDataPoint])
 async def get_cash_flow(db: Session = Depends(get_db)):
+    """
+    Get weekly Cash Inflows vs Outflows based on actual dates from CSV data.
+    Uses date columns and inflow/outflow columns from uploaded documents.
+    X-axis shows actual dates or week labels derived from the data.
+    """
     documents = await CSVRepository.list_documents_with_full_data()
     document_ids = [doc.id for doc in documents]
     metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
@@ -561,28 +639,41 @@ async def get_cash_flow(db: Session = Depends(get_db)):
     llm_points = _get_cached_response(cache_key)
     
     if llm_points is None:
-        # Cache miss - call LLM
+        # Cache miss - call LLM to extract dates and group by weeks
         llm_points = get_cash_flow_from_openrouter(dataset)
         _set_cached_response(cache_key, llm_points)
     
     logger.info("/flow OpenRouter response: %s", llm_points)
     print("/flow OpenRouter response:", llm_points, flush=True)
 
+    # Transform LLM response to CashFlowDataPoint objects
     result: List[CashFlowDataPoint] = []
-    from datetime import datetime, timedelta
-    for i in range(4):
-        default_week = f"Week {i + 1}"
-        # Calculate default date (going backwards from today)
-        default_date = (datetime.now() - timedelta(days=(3 - i) * 7)).strftime("%Y-%m-%d")
-        point = llm_points[i] if isinstance(llm_points, list) and len(llm_points) > i else {}
-        result.append(
-            CashFlowDataPoint(
-                week=point.get("week") or default_week,
-                date=point.get("date") or default_date,
-                inflows=_to_float(point.get("inflows")),
-                outflows=_to_float(point.get("outflows")),
+    
+    if isinstance(llm_points, list) and len(llm_points) > 0:
+        # Use actual dates from LLM response
+        for point in llm_points:
+            result.append(
+                CashFlowDataPoint(
+                    week=point.get("week", ""),
+                    date=point.get("date", ""),  # Use actual date from data
+                    inflows=_to_float(point.get("inflows", 0)),
+                    outflows=_to_float(point.get("outflows", 0)),
+                )
             )
-        )
+    else:
+        # Fallback: generate default weeks if LLM returns empty
+        from datetime import datetime, timedelta
+        for i in range(4):
+            default_week = f"Week {i + 1}"
+            default_date = (datetime.now() - timedelta(days=(3 - i) * 7)).strftime("%Y-%m-%d")
+            result.append(
+                CashFlowDataPoint(
+                    week=default_week,
+                    date=default_date,
+                    inflows=0.0,
+                    outflows=0.0,
+                )
+            )
 
     print("/flow API response payload:", [p.model_dump() for p in result], flush=True)
     return result
@@ -1089,3 +1180,123 @@ def _enhance_with_professional_formatting(response: str, chart_data: ChartDataSc
 Review the visualization below for detailed insights and trends. The chart provides a clear view of your data patterns and helps identify key opportunities for improvement."""
 
     return enhanced_response
+
+
+@router.get("/shortfalls", response_model=ShortfallResponse)
+async def get_shortfalls(db: Session = Depends(get_db)):
+    """
+    Detect and analyze cash shortfall periods from dynamic cash flow forecast.
+    Analyzes CSV data to find weeks with negative closing balance.
+    Returns detailed shortfall information with drivers and recommendations.
+    """
+    try:
+        # Fetch all documents with full data (async method)
+        documents = await CSVRepository.list_documents_with_full_data()
+        if not documents:
+            return ShortfallResponse(periods=[], totalShortfall=0.0, hasShortfalls=False)
+        
+        # Get metadata for all documents
+        document_ids = [doc.id for doc in documents]
+        metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
+        
+        # Build dataset for LLM analysis
+        dataset = {
+            "documents": [
+                {
+                    "id": doc.id,
+                    "filename": doc.filename,
+                    "row_count": doc.row_count,
+                    "column_count": doc.column_count,
+                    "upload_date": str(doc.upload_date),
+                    "full_data": doc.full_data or [],
+                    "metadata": [
+                        {
+                            "column_name": meta.column_name,
+                            "data_type": meta.data_type,
+                            "connection_key": meta.connection_key,
+                            "alias": meta.alias,
+                            "description": meta.description,
+                            "is_target": meta.is_target,
+                            "is_helper": meta.is_helper
+                        }
+                        for meta in metadata_by_doc.get(doc.id, [])
+                        if meta.is_target or meta.is_helper
+                    ]
+                }
+                for doc in documents
+            ]
+        }
+        
+        # Get current balance from stats
+        current_stats = await get_dashboard_stats(db)
+        current_balance = _to_float(current_stats.current if current_stats else 0.0)
+        
+        logger.info(f"Dataset prepared with {len(documents)} documents, current_balance={current_balance}")
+        
+        # Get dynamic cash flow (synchronously)
+        flow_data = get_dynamic_cash_flow_from_openrouter(dataset, current_balance)
+        
+        logger.info(f"Flow data from LLM: {flow_data}")
+        
+        if not flow_data or len(flow_data) == 0:
+            logger.warning("No cash flow data returned from LLM analysis")
+            return ShortfallResponse(periods=[], totalShortfall=0.0, hasShortfalls=False)
+        
+        # Detect shortfalls from the flow data
+        shortfall_periods = []
+        total_shortfall = 0.0
+        
+        for item in flow_data:
+            closing_balance = _to_float(item.get("closingBalance", 0))
+            week = item.get("week", "")
+            inflows = _to_float(item.get("projectedInflows", 0))
+            outflows = _to_float(item.get("projectedOutflows", 0))
+            
+            # Check if closing balance is negative (shortfall)
+            if closing_balance < 0:
+                net_flow = inflows - outflows
+                shortfall_amount = abs(closing_balance)
+                
+                # Determine severity based on shortfall amount
+                if shortfall_amount > 200000:
+                    priority = "High"
+                elif shortfall_amount > 100000:
+                    priority = "Medium"
+                else:
+                    priority = "Low"
+                
+                # Generate key drivers based on data
+                key_drivers = []
+                if outflows > inflows:
+                    key_drivers.append(f"Outflows (${outflows:,.2f}) exceed inflows (${inflows:,.2f})")
+                    key_drivers.append("Insufficient cash reserves to cover the deficit")
+                    key_drivers.append("Urgent funding or cost reduction required")
+                else:
+                    key_drivers.append("Cumulative cash depletion from previous periods")
+                    key_drivers.append("Starting balance insufficient for projected expenses")
+                
+                shortfall_period = ShortfallPeriod(
+                    week=week,
+                    shortfall=shortfall_amount,
+                    priority=priority,
+                    closingBalance=closing_balance,
+                    projectedInflows=inflows,
+                    projectedOutflows=outflows,
+                    netCashFlow=net_flow,
+                    gap=shortfall_amount,
+                    keyDrivers=key_drivers
+                )
+                shortfall_periods.append(shortfall_period)
+                total_shortfall += shortfall_amount
+        
+        logger.info(f"Detected {len(shortfall_periods)} shortfall periods")
+        
+        return ShortfallResponse(
+            periods=shortfall_periods,
+            totalShortfall=total_shortfall,
+            hasShortfalls=len(shortfall_periods) > 0
+        )
+    
+    except Exception as e:
+        logger.error(f"Error detecting shortfalls: {str(e)}", exc_info=True)
+        return ShortfallResponse(periods=[], totalShortfall=0.0, hasShortfalls=False)

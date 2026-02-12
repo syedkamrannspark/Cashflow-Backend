@@ -53,6 +53,22 @@ class CashFlowDataPoint(BaseModel):
     inflows: float
     outflows: float
 
+class ShortfallPeriod(BaseModel):
+    week: str
+    shortfall: float
+    priority: str  # 'High', 'Medium', 'Low'
+    closingBalance: float
+    projectedInflows: float
+    projectedOutflows: float
+    netCashFlow: float
+    gap: float
+    keyDrivers: List[str]
+
+class ShortfallResponse(BaseModel):
+    periods: List[ShortfallPeriod]
+    totalShortfall: float
+    hasShortfalls: bool
+
 class Invoice(BaseModel):
     id: str
     customer: str
