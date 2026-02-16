@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "llama-3.3-70b-versatile"
     # LLM_MODEL: str = "meta-llama/llama-3.1-8b-instruct"
     
-    allowed_extensions: List[str] = [".csv"]
+    allowed_extensions: List[str] = [".csv", ".xlsx", ".xls"]
     max_file_size: int = 200 * 1024 * 1024
 
     class Config:

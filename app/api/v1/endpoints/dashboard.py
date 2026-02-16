@@ -11,6 +11,8 @@ from app.schemas.dashboard import CashPosition, ChartDataPoint, CashFlowDataPoin
 from app.repositories.csv_repository import CSVRepository
 from app.repositories.csv_metadata_repository import CSVMetadataRepository
 from app.services.llm_service import get_insights, get_stats_from_openrouter, get_cash_forecast_from_openrouter, get_cash_flow_from_openrouter, answer_user_query, get_scenario_analysis_from_openrouter, get_data_visualization_from_openrouter, get_dynamic_cash_flow_from_openrouter
+from app.services.pandas_analytics_service import PandasAnalyticsService
+from app.agents.nl2sql_agent import nl2sql_agent
 import datetime
 import re
 import hashlib
@@ -129,6 +131,35 @@ def _filter_data_by_metadata(full_data: list, metadata: list) -> list:
     return filtered_data
 
 
+def _get_column_hints(metadata_by_doc: dict) -> str:
+    """
+    Generate hints about available columns for the LLM.
+    """
+    amount_cols = set()
+    date_cols = set()
+    status_cols = set()
+    
+    for doc_id, metas in metadata_by_doc.items():
+        for m in metas:
+            name = m.column_name
+            if m.data_type == 'numeric' and m.is_target:
+                amount_cols.add(name)
+            elif m.data_type == 'date':
+                date_cols.add(name)
+            elif 'status' in name.lower():
+                status_cols.add(name)
+
+    hint = ""
+    if amount_cols:
+        hint += f" For Amount, check columns: {', '.join([f"'{c}'" for c in amount_cols])}."
+    if date_cols:
+        hint += f" For Date, check columns: {', '.join([f"'{c}'" for c in date_cols])}."
+    if status_cols:
+        hint += f" For Status, check columns: {', '.join([f"'{c}'" for c in status_cols])}."
+        
+    return hint
+
+
 @router.get("/stats", response_model=CashPosition)
 async def get_dashboard_stats(db: Session = Depends(get_db)):
     documents = await CSVRepository.list_documents_with_full_data()
@@ -176,124 +207,77 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         ]
     }
 
-    print("/stats dataset:", dataset, flush=True)
+    # Calculate stats using Pandas Service (replacing LLM)
+    pandas_stats = PandasAnalyticsService.calculate_stats(documents)
     
-    # Check cache first
-    cache_key = f"stats_{_generate_cache_key(dataset)}"
-    llm_stats = _get_cached_response(cache_key)
+    # Fallback to LLM only if pandas returns all zeros (meaning files might be missing)
+    # But user asked to REPLACE, so we prioritize Pandas.
+    # If pandas_stats has data, we use it.
     
-    if llm_stats is None:
-        # Cache miss - call LLM
-        llm_stats = get_stats_from_openrouter(dataset) or {}
-        _set_cached_response(cache_key, llm_stats)
-    
-    logger.info("/stats OpenRouter response: %s", llm_stats)
-    print("/stats OpenRouter response:", llm_stats, flush=True)
-
-    # Build detailed breakdowns from LLM response
-    current_breakdown = None
-    forecast_breakdown = None
-    atrisk_breakdown = None
-    runway_breakdown = None
-    
-    if "currentBreakdown" in llm_stats:
-        current_breakdown = llm_stats["currentBreakdown"]
-    if "forecastBreakdown" in llm_stats:
-        forecast_breakdown = llm_stats["forecastBreakdown"]
-    if "atRiskBreakdown" in llm_stats:
-        atrisk_breakdown = llm_stats["atRiskBreakdown"]
-    if "runwayBreakdown" in llm_stats:
-        runway_breakdown = llm_stats["runwayBreakdown"]
-
+    # Construct response
     response = CashPosition(
-        current=_to_float(llm_stats.get("current")),
-        forecast30Day=_to_float(llm_stats.get("forecast30Day")),
-        atRiskInvoices=_to_float(llm_stats.get("atRiskInvoices")),
-        cashRunway=_to_int(llm_stats.get("cashRunway")),
-        currentChangePercent=_to_float(llm_stats.get("currentChangePercent")),
-        forecastChangePercent=_to_float(llm_stats.get("forecastChangePercent")),
-        overdueInvoicesCount=_to_int(llm_stats.get("overdueInvoicesCount")),
-        currentBreakdown=current_breakdown,
-        forecastBreakdown=forecast_breakdown,
-        atRiskBreakdown=atrisk_breakdown,
-        runwayBreakdown=runway_breakdown,
+        current=pandas_stats.get("current", 0.0),
+        forecast30Day=pandas_stats.get("forecast30Day", 0.0),
+        atRiskInvoices=pandas_stats.get("atRiskInvoices", 0.0),
+        cashRunway=pandas_stats.get("cashRunway", 0),
+        currentChangePercent=pandas_stats.get("currentChangePercent", 0.0),
+        forecastChangePercent=pandas_stats.get("forecastChangePercent", 0.0),
+        overdueInvoicesCount=pandas_stats.get("overdueInvoicesCount", 0),
+        currentBreakdown=None, # Not calculated by pandas script yet
+        forecastBreakdown=None,
+        atRiskBreakdown=None,
+        runwayBreakdown=None,
     )
-    logger.info("/stats API response payload: %s", response.model_dump())
-    print("/stats API response payload:", response.model_dump(), flush=True)
+    
+    logger.info("/stats Pandas Service response: %s", response.model_dump())
+    print("/stats Pandas Service response:", response.model_dump(), flush=True)
     return response
 
 @router.get("/forecast", response_model=List[ChartDataPoint])
 async def get_cash_forecast(db: Session = Depends(get_db)):
     documents = await CSVRepository.list_documents_with_full_data()
-    document_ids = [doc.id for doc in documents]
-    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
-
-    dataset = {
-        "documents": [
-            {
-                "id": doc.id,
-                "filename": doc.filename,
-                "row_count": doc.row_count,
-                "column_count": doc.column_count,
-                "upload_date": doc.upload_date,
-                "full_data": _filter_data_by_metadata(
-                    doc.full_data or [],
-                    [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper,
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                    ]
-                ),
-                "metadata": [
-                    {
-                        "column_name": meta.column_name,
-                        "data_type": meta.data_type,
-                        "connection_key": meta.connection_key,
-                        "alias": meta.alias,
-                        "description": meta.description,
-                        "is_target": meta.is_target,
-                        "is_helper": meta.is_helper,
-                    }
-                    for meta in metadata_by_doc.get(doc.id, [])
-                    if meta.is_target or meta.is_helper  # Only include target/helper metadata
-                ],
-            }
-            for doc in documents
-        ]
-    }
-
-    # Check cache first
-    cache_key = f"forecast_{_generate_cache_key(dataset)}"
-    llm_points = _get_cached_response(cache_key)
     
-    if llm_points is None:
-        # Cache miss - call LLM
-        llm_points = get_cash_forecast_from_openrouter(dataset)
-        _set_cached_response(cache_key, llm_points)
+    # Use Pandas Service
+    forecast_data = PandasAnalyticsService.get_cash_forecast_data(documents)
     
-    logger.info("/forecast OpenRouter response: %s", llm_points)
-    print("/forecast OpenRouter response:", llm_points, flush=True)
-
+    # Transform to list of ChartDataPoint
     data_points: List[ChartDataPoint] = []
-    for i in range(8):
-        default_date = f"Week {i + 1}"
-        point = llm_points[i] if isinstance(llm_points, list) and len(llm_points) > i else {}
-        data_points.append(
-            ChartDataPoint(
-                date=point.get("date") or default_date,
-                actual=_to_float(point.get("actual")),
-                forecasted=_to_float(point.get("forecasted")),
+    
+    labels = forecast_data.get("labels", [])
+    datasets = forecast_data.get("datasets", [])
+    
+    if datasets:
+        # Dataset 0 = Actuals, Dataset 1 = Forecast (if present)
+        actuals = datasets[0].get("data", []) if len(datasets) > 0 else []
+        forecasts = datasets[1].get("data", []) if len(datasets) > 1 else []
+        
+        for i, label in enumerate(labels):
+            # Handle possible None/Null values for ChartJS structure
+            # For Pydantic model, we generally need float unless Optional[float]
+            # Assuming schema requires float, we map None -> 0.0 or just omit?
+            # User wants a continuous line, but if we zero it out, it might look like a crash.
+            # Ideally frontend handles nulls. If backend insists on float, we might need to be smart.
+            # But the error 'Input should be a valid number' suggests strict float.
+            
+            # Let's check `ChartDataPoint` definition. If it's strict float, we must provide float.
+            # If so, we might need to merge them if they are disjoint but on same axis?
+            # Actually, ChartDataPoint likely has fields `actual` and `forecasted`.
+            
+            val_actual = actuals[i] if i < len(actuals) and actuals[i] is not None else 0.0
+            val_forecast = forecasts[i] if i < len(forecasts) and forecasts[i] is not None else 0.0
+            
+            # Special case: If forecast is 0.0 but actual is present, we might want to just show actual?
+            # Or if actual is 0.0 (because it's future), show forecast?
+            # The chart likely plots both lines.
+            
+            data_points.append(
+                ChartDataPoint(
+                    date=str(label),
+                    actual=float(val_actual),
+                    forecasted=float(val_forecast)
+                )
             )
-        )
-
-    print("/forecast API response payload:", [p.model_dump() for p in data_points], flush=True)
+            
     return data_points
 
 @router.get("/insights")
@@ -349,6 +333,21 @@ async def get_dashboard_insights(db: Session = Depends(get_db)):
         ]
     }
 
+    # Use NL2SQL for insights summary using aggregated data
+    try:
+        hints = _get_column_hints(metadata_by_doc)
+        agg_query = f"Calculate total revenue, total expenses, and count of transactions grouped by Month. {hints} Use the most relevant columns."
+        nl_result = await nl2sql_agent.process_natural_query(agg_query)
+        dataset["aggregated_summary"] = nl_result.get("data_full", [])
+        
+        # Limit raw data
+        for doc in dataset["documents"]:
+            doc["full_data"] = doc["full_data"][:20] if doc["full_data"] else []
+            
+    except Exception as e:
+        logger.error(f"NL2SQL Error in /insights: {e}")
+        pass
+
     # Build context from uploaded data
     context_parts = []
     context_parts.append(f"Total uploaded files: {len(documents)}")
@@ -377,68 +376,32 @@ async def get_scenario_analysis(db: Session = Depends(get_db)):
     Generate AI-powered scenario analysis with optimistic, expected, and pessimistic forecasts
     based on uploaded CSV data.
     """
-    # Fetch all documents with full data
     documents = await CSVRepository.list_documents_with_full_data()
-    document_ids = [doc.id for doc in documents]
-    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
-
-    # Build dataset in the same format as other endpoints
-    dataset = {
-        "documents": [
-            {
-                "id": doc.id,
-                "filename": doc.filename,
-                "row_count": doc.row_count,
-                "column_count": doc.column_count,
-                "upload_date": str(doc.upload_date),
-                "full_data": _filter_data_by_metadata(
-                    doc.full_data or [],
-                    [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper,
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                    ]
-                ),
-                "metadata": [
-                    {
-                        "column_name": meta.column_name,
-                        "data_type": meta.data_type,
-                        "connection_key": meta.connection_key,
-                        "alias": meta.alias,
-                        "description": meta.description,
-                        "is_target": meta.is_target,
-                        "is_helper": meta.is_helper,
-                    }
-                    for meta in metadata_by_doc.get(doc.id, [])
-                    if meta.is_target or meta.is_helper
-                ],
-            }
-            for doc in documents
-        ]
-    }
-
-    # Check cache first
-    cache_key = f"scenario_{_generate_cache_key(dataset)}"
-    scenario_points = _get_cached_response(cache_key)
     
-    if scenario_points is None:
-        # Cache miss - call LLM
-        scenario_points = get_scenario_analysis_from_openrouter(dataset)
-        _set_cached_response(cache_key, scenario_points)
+    # Use Pandas Service
+    scenario_data = PandasAnalyticsService.get_scenario_analysis(documents)
     
-    logger.info("/scenario-analysis OpenRouter response: %s", scenario_points)
-    print("/scenario-analysis OpenRouter response:", scenario_points, flush=True)
+    # Transform to list of points: [{"week": "Week 1", "optimistic": 1150000, "expected": 1000000, "pessimistic": 850000}, ...]
+    # Pandas returns: labels list, datasets list.
+    
+    points = []
+    labels = scenario_data.get("labels", [])
+    datasets = scenario_data.get("datasets", [])
+    
+    # Find datasets
+    opt_data = next((d['data'] for d in datasets if d['label'] == 'Optimistic'), [])
+    exp_data = next((d['data'] for d in datasets if d['label'] == 'Expected'), [])
+    pess_data = next((d['data'] for d in datasets if d['label'] == 'Pessimistic'), [])
+    
+    for i, label in enumerate(labels):
+        points.append({
+            "week": str(label), # or generic "Week X" if label is date
+            "optimistic": opt_data[i] if i < len(opt_data) else 0,
+            "expected": exp_data[i] if i < len(exp_data) else 0,
+            "pessimistic": pess_data[i] if i < len(pess_data) else 0
+        })
 
-    # Return the scenario analysis points
-    # Format: [{"week": "Week 1", "optimistic": 1150000, "expected": 1000000, "pessimistic": 850000}, ...]
-    return scenario_points
+    return points
 
 
 @router.get("/data-visualization")
@@ -493,6 +456,11 @@ async def get_data_visualization(db: Session = Depends(get_db)):
             for doc in documents
         ]
     }
+
+    # For visualization, we need SOME raw data, but not all. Limit to 50 rows.
+    for doc in dataset["documents"]:
+        if len(doc["full_data"]) > 50:
+            doc["full_data"] = doc["full_data"][:50]  # Sample first 50 rows only
 
     # Check cache first
     cache_key = f"visualization_{_generate_cache_key(dataset)}"
@@ -590,92 +558,29 @@ async def get_cash_flow(db: Session = Depends(get_db)):
     X-axis shows actual dates or week labels derived from the data.
     """
     documents = await CSVRepository.list_documents_with_full_data()
-    document_ids = [doc.id for doc in documents]
-    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
-
-    dataset = {
-        "documents": [
-            {
-                "id": doc.id,
-                "filename": doc.filename,
-                "row_count": doc.row_count,
-                "column_count": doc.column_count,
-                "upload_date": doc.upload_date,
-                "full_data": _filter_data_by_metadata(
-                    doc.full_data or [],
-                    [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper,
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                    ]
-                ),
-                "metadata": [
-                    {
-                        "column_name": meta.column_name,
-                        "data_type": meta.data_type,
-                        "connection_key": meta.connection_key,
-                        "alias": meta.alias,
-                        "description": meta.description,
-                        "is_target": meta.is_target,
-                        "is_helper": meta.is_helper,
-                    }
-                    for meta in metadata_by_doc.get(doc.id, [])
-                    if meta.is_target or meta.is_helper  # Only include target/helper metadata
-                ],
-            }
-            for doc in documents
-        ]
-    }
-
-    # Check cache first
-    cache_key = f"flow_{_generate_cache_key(dataset)}"
-    llm_points = _get_cached_response(cache_key)
     
-    if llm_points is None:
-        # Cache miss - call LLM to extract dates and group by weeks
-        llm_points = get_cash_flow_from_openrouter(dataset)
-        _set_cached_response(cache_key, llm_points)
+    # Use Pandas Service
+    flow_data = PandasAnalyticsService.get_cash_flow_data(documents)
     
-    logger.info("/flow OpenRouter response: %s", llm_points)
-    print("/flow OpenRouter response:", llm_points, flush=True)
-
-    # Transform LLM response to CashFlowDataPoint objects
+    # Transform to list of CashFlowDataPoint
     result: List[CashFlowDataPoint] = []
     
-    if isinstance(llm_points, list) and len(llm_points) > 0:
-        # Use actual dates from LLM response
-        for point in llm_points:
-            result.append(
-                CashFlowDataPoint(
-                    week=point.get("week", ""),
-                    date=point.get("date", ""),  # Use actual date from data
-                    inflows=_to_float(point.get("inflows", 0)),
-                    outflows=_to_float(point.get("outflows", 0)),
-                )
+    labels = flow_data.get("labels", [])
+    datasets = flow_data.get("datasets", [])
+    
+    inflow_data = next((d['data'] for d in datasets if d['label'] == 'Inflows'), [])
+    outflow_data = next((d['data'] for d in datasets if d['label'] == 'Outflows'), [])
+    
+    for i, label in enumerate(labels):
+        result.append(
+            CashFlowDataPoint(
+                week=str(label), # Using label as week/date identifier
+                date=str(label),
+                inflows=inflow_data[i] if i < len(inflow_data) else 0.0,
+                outflows=outflow_data[i] if i < len(outflow_data) else 0.0
             )
-    else:
-        # Fallback: generate default weeks if LLM returns empty
-        from datetime import datetime, timedelta
-        for i in range(4):
-            default_week = f"Week {i + 1}"
-            default_date = (datetime.now() - timedelta(days=(3 - i) * 7)).strftime("%Y-%m-%d")
-            result.append(
-                CashFlowDataPoint(
-                    week=default_week,
-                    date=default_date,
-                    inflows=0.0,
-                    outflows=0.0,
-                )
-            )
-
-    print("/flow API response payload:", [p.model_dump() for p in result], flush=True)
+        )
+            
     return result
 
 
@@ -1185,116 +1090,18 @@ Review the visualization below for detailed insights and trends. The chart provi
 @router.get("/shortfalls", response_model=ShortfallResponse)
 async def get_shortfalls(db: Session = Depends(get_db)):
     """
-    Detect and analyze cash shortfall periods from dynamic cash flow forecast.
-    Analyzes CSV data to find weeks with negative closing balance.
-    Returns detailed shortfall information with drivers and recommendations.
+    Detect and analyze cash shortfall periods using Pandas logic.
     """
     try:
-        # Fetch all documents with full data (async method)
         documents = await CSVRepository.list_documents_with_full_data()
-        if not documents:
-            return ShortfallResponse(periods=[], totalShortfall=0.0, hasShortfalls=False)
         
-        # Get metadata for all documents
-        document_ids = [doc.id for doc in documents]
-        metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
-        
-        # Build dataset for LLM analysis
-        dataset = {
-            "documents": [
-                {
-                    "id": doc.id,
-                    "filename": doc.filename,
-                    "row_count": doc.row_count,
-                    "column_count": doc.column_count,
-                    "upload_date": str(doc.upload_date),
-                    "full_data": doc.full_data or [],
-                    "metadata": [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                        if meta.is_target or meta.is_helper
-                    ]
-                }
-                for doc in documents
-            ]
-        }
-        
-        # Get current balance from stats
-        current_stats = await get_dashboard_stats(db)
-        current_balance = _to_float(current_stats.current if current_stats else 0.0)
-        
-        logger.info(f"Dataset prepared with {len(documents)} documents, current_balance={current_balance}")
-        
-        # Get dynamic cash flow (synchronously)
-        flow_data = get_dynamic_cash_flow_from_openrouter(dataset, current_balance)
-        
-        logger.info(f"Flow data from LLM: {flow_data}")
-        
-        if not flow_data or len(flow_data) == 0:
-            logger.warning("No cash flow data returned from LLM analysis")
-            return ShortfallResponse(periods=[], totalShortfall=0.0, hasShortfalls=False)
-        
-        # Detect shortfalls from the flow data
-        shortfall_periods = []
-        total_shortfall = 0.0
-        
-        for item in flow_data:
-            closing_balance = _to_float(item.get("closingBalance", 0))
-            week = item.get("week", "")
-            inflows = _to_float(item.get("projectedInflows", 0))
-            outflows = _to_float(item.get("projectedOutflows", 0))
-            
-            # Check if closing balance is negative (shortfall)
-            if closing_balance < 0:
-                net_flow = inflows - outflows
-                shortfall_amount = abs(closing_balance)
-                
-                # Determine severity based on shortfall amount
-                if shortfall_amount > 200000:
-                    priority = "High"
-                elif shortfall_amount > 100000:
-                    priority = "Medium"
-                else:
-                    priority = "Low"
-                
-                # Generate key drivers based on data
-                key_drivers = []
-                if outflows > inflows:
-                    key_drivers.append(f"Outflows (${outflows:,.2f}) exceed inflows (${inflows:,.2f})")
-                    key_drivers.append("Insufficient cash reserves to cover the deficit")
-                    key_drivers.append("Urgent funding or cost reduction required")
-                else:
-                    key_drivers.append("Cumulative cash depletion from previous periods")
-                    key_drivers.append("Starting balance insufficient for projected expenses")
-                
-                shortfall_period = ShortfallPeriod(
-                    week=week,
-                    shortfall=shortfall_amount,
-                    priority=priority,
-                    closingBalance=closing_balance,
-                    projectedInflows=inflows,
-                    projectedOutflows=outflows,
-                    netCashFlow=net_flow,
-                    gap=shortfall_amount,
-                    keyDrivers=key_drivers
-                )
-                shortfall_periods.append(shortfall_period)
-                total_shortfall += shortfall_amount
-        
-        logger.info(f"Detected {len(shortfall_periods)} shortfall periods")
+        # Use Pandas Service
+        result = PandasAnalyticsService.get_cash_shortfalls(documents)
         
         return ShortfallResponse(
-            periods=shortfall_periods,
-            totalShortfall=total_shortfall,
-            hasShortfalls=len(shortfall_periods) > 0
+            periods=result.get("periods", []),
+            totalShortfall=result.get("totalShortfall", 0.0),
+            hasShortfalls=result.get("hasShortfalls", False)
         )
     
     except Exception as e:

@@ -6,6 +6,7 @@ from app.schemas.dashboard import Invoice, InvoiceResponse
 from app.repositories.csv_repository import CSVRepository
 from app.repositories.csv_metadata_repository import CSVMetadataRepository
 from app.services.llm_service import extract_invoices_from_data
+from app.services.pandas_analytics_service import PandasAnalyticsService
 import logging
 
 router = APIRouter()
@@ -59,53 +60,11 @@ async def read_invoices(
         if not documents:
             return InvoiceResponse(items=[], total=0, page=1, limit=limit)
         
-        document_ids = [doc.id for doc in documents]
-        metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
-
-        # Build dataset in the same format as other endpoints
-        dataset = {
-            "documents": [
-                {
-                    "id": doc.id,
-                    "filename": doc.filename,
-                    "row_count": doc.row_count,
-                    "column_count": doc.column_count,
-                    "upload_date": str(doc.upload_date),
-                    "full_data": _filter_data_by_metadata(
-                        doc.full_data or [],
-                        [
-                            {
-                                "column_name": meta.column_name,
-                                "data_type": meta.data_type,
-                                "connection_key": meta.connection_key,
-                                "alias": meta.alias,
-                                "description": meta.description,
-                                "is_target": meta.is_target,
-                                "is_helper": meta.is_helper,
-                            }
-                            for meta in metadata_by_doc.get(doc.id, [])
-                        ]
-                    ),
-                    "metadata": [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper,
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                        if meta.is_target or meta.is_helper
-                    ],
-                }
-                for doc in documents
-            ]
-        }
-
-        # Extract invoices from the dataset using LLM
-        all_invoices = extract_invoices_from_data(dataset)
+        if not documents:
+            return InvoiceResponse(items=[], total=0, page=1, limit=limit)
+        
+        # Use Pandas Service to extract invoices
+        all_invoices = PandasAnalyticsService.get_invoices_data(documents)
         
         logger.info(f"Extracted {len(all_invoices)} invoices from uploaded data")
         print(f"Extracted {len(all_invoices)} invoices from uploaded data", flush=True)
@@ -125,25 +84,39 @@ async def read_invoices(
         # Apply pagination
         paginated_invoices = filtered_invoices[skip : skip + limit]
 
+        # Get global stats
+        stats_data = PandasAnalyticsService.get_invoices_stats(documents)
+        
         # Convert to Invoice schema
         items = [
             Invoice(
-                id=inv["id"],
-                customer=inv["customer"],
-                amount=inv["amount"],
-                dueDate=inv["dueDate"],
-                status=inv["status"],
-                riskScore=inv["riskScore"],
-                aiPrediction=inv["aiPrediction"]
+                id=str(inv["id"]),
+                customer=str(inv["customer"]),
+                amount=float(inv["amount"]),
+                dueDate=str(inv["dueDate"]),
+                status=str(inv["status"]),
+                riskScore=int(inv["riskScore"]),
+                aiPrediction=str(inv["aiPrediction"])
             )
             for inv in paginated_invoices
         ]
+
+        from app.schemas.dashboard import InvoiceStats
+        
+        invoice_stats = InvoiceStats(
+            totalReceivables=stats_data["totalReceivables"],
+            totalAtRiskAmount=stats_data["totalAtRiskAmount"],
+            collectionRate=stats_data["collectionRate"],
+            activeInvoiceCount=stats_data["activeInvoiceCount"],
+            atRiskInvoiceCount=stats_data["atRiskInvoiceCount"]
+        )
 
         return InvoiceResponse(
             items=items,
             total=total,
             page=(skip // limit) + 1,
-            limit=limit
+            limit=limit,
+            stats=invoice_stats
         )
 
     except Exception as e:

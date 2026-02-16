@@ -62,3 +62,34 @@ class CSVMetadataRepository:
             return False
         finally:
             db.close()
+
+    @staticmethod
+    async def create_metadata(metadata_data: dict) -> CSVMetadata:
+        """Create a single metadata entry"""
+        db = SessionLocal()
+        try:
+            # Check if exists
+            existing = db.query(CSVMetadata).filter(
+                CSVMetadata.document_id == metadata_data["document_id"],
+                CSVMetadata.column_name == metadata_data["column_name"]
+            ).first()
+            
+            if existing:
+                # Update existing
+                for key, value in metadata_data.items():
+                    setattr(existing, key, value)
+                db.commit()
+                db.refresh(existing)
+                return existing
+            else:
+                # Create new
+                metadata = CSVMetadata(**metadata_data)
+                db.add(metadata)
+                db.commit()
+                db.refresh(metadata)
+                return metadata
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()

@@ -16,28 +16,28 @@ router = APIRouter(tags=["CSV Management"])
 @router.post(
     "/upload-single",
     response_model=UploadResponse,
-    summary="Upload Single CSV File",
-    description="Upload a single CSV file and get preview data with full storage in database"
+    summary="Upload Single File (CSV or Excel)",
+    description="Upload a single CSV or Excel file. For Excel files, each sheet will be saved as a separate document."
 )
 async def upload_single_csv_file(
-    file: UploadFile = File(..., description="Single CSV file to upload (max 200MB)")
+    file: UploadFile = File(..., description="Single CSV or Excel file to upload (max 200MB)")
 ):
     """
-    Upload a single CSV file and return preview data.
+    Upload a single CSV/Excel file and return preview data.
     
-    - **file**: Single CSV file to upload
-    - Returns: Uploaded document with preview data
+    - **file**: Single CSV or Excel file to upload
+    - Returns: List of uploaded documents (one per sheet for Excel) with preview data
     """
     try:
         if not file or file.filename == '':
             raise HTTPException(status_code=400, detail="No file provided")
         
-        result = await CSVService.upload_single_csv_file(file)
+        results = await CSVService.upload_single_csv_file(file)
         
         return UploadResponse(
             success=True,
-            data=[result],
-            message="Successfully uploaded file"
+            data=results,
+            message=f"Successfully uploaded {len(results)} document(s)"
         )
         
     except HTTPException:
@@ -49,17 +49,17 @@ async def upload_single_csv_file(
 @router.post(
     "/upload-multiple",
     response_model=UploadResponse,
-    summary="Upload Multiple CSV Files",
-    description="Upload multiple CSV files and get preview data with full storage in database"
+    summary="Upload Multiple Files (CSV or Excel)",
+    description="Upload multiple CSV or Excel files. For Excel files, each sheet will be saved as a separate document."
 )
 async def upload_multiple_csv_files(
-    files: List[UploadFile] = File(..., description="Multiple CSV files to upload (max 200MB each)")
+    files: List[UploadFile] = File(..., description="Multiple CSV or Excel files to upload (max 200MB each)")
 ):
     """
-    Upload multiple CSV files and return preview data.
+    Upload multiple CSV/Excel files and return preview data.
     
-    - **files**: List of CSV files to upload
-    - Returns: List of uploaded documents with preview data
+    - **files**: List of CSV or Excel files to upload
+    - Returns: List of all created documents with preview data
     """
     try:
         if not files:
@@ -116,11 +116,11 @@ async def upload_csv_files_deprecated(
         
         # Route to appropriate new endpoint based on file count
         if len(files) == 1:
-            result = await CSVService.upload_single_csv_file(files[0])
+            results = await CSVService.upload_single_csv_file(files[0])
             return UploadResponse(
                 success=True,
-                data=[result],
-                message="Successfully uploaded file (consider using /upload-single endpoint)"
+                data=results,
+                message=f"Successfully uploaded {len(results)} document(s) (consider using /upload-single endpoint)"
             )
         else:
             results = await CSVService.upload_csv_files(files)

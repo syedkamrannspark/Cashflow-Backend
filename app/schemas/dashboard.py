@@ -78,8 +78,16 @@ class Invoice(BaseModel):
     riskScore: float
     aiPrediction: str
 
+class InvoiceStats(BaseModel):
+    totalReceivables: float
+    totalAtRiskAmount: float
+    collectionRate: float
+    activeInvoiceCount: int
+    atRiskInvoiceCount: int
+
 class InvoiceResponse(BaseModel):
     items: List[Invoice]
     total: int
     page: int
     limit: int
+    stats: Optional[InvoiceStats] = None

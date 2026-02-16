@@ -10,3 +10,5 @@ pydantic
 pydantic-settings
 openai
 httpx
+aiohttp
+aiohttp

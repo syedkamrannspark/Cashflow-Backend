@@ -69,32 +69,63 @@ class CSVService:
         # File size validation will be handled by FastAPI's File size limit
         
     @staticmethod
-    async def parse_csv_content(content: bytes, filename: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, int]:
-        """Parse CSV content and return preview, full data, and metadata"""
+    async def parse_file_content(content: bytes, filename: str) -> List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, int, str]]:
+        """Parse file content (CSV or Excel) and return list of (preview, full data, row_count, col_count, sheet_name)"""
+        results = []
         try:
-            # Decode content
-            csv_string = content.decode('utf-8')
+            if filename.lower().endswith(('.xlsx', '.xls')):
+                # Handle Excel
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name)
+                    
+                    if df.empty:
+                        continue # Skip empty sheets
+                        
+                    # Handle NaN values
+                    df = df.astype(object).where(pd.notnull(df), None)
+                    
+                    preview_data = df.head(5).to_dict('records')
+                    full_data = df.to_dict('records')
+                    row_count = len(df)
+                    column_count = len(df.columns)
+                    
+                    results.append((preview_data, full_data, row_count, column_count, sheet_name))
+                    
+                if not results:
+                     raise HTTPException(status_code=400, detail=f"File {filename} is empty or all sheets are empty")
+                     
+            else:
+                # Handle CSV
+                # Decode content
+                try:
+                    csv_string = content.decode('utf-8')
+                except UnicodeDecodeError:
+                    # Try alternate encoding if utf-8 fails
+                    csv_string = content.decode('latin-1')
+                
+                # Parse CSV with pandas
+                df = pd.read_csv(io.StringIO(csv_string))
+                
+                if df.empty:
+                    raise HTTPException(status_code=400, detail=f"File {filename} is empty")
+                
+                # Handle NaN values by converting to None for JSON serialization
+                df = df.astype(object).where(pd.notnull(df), None)
+                
+                # Get preview (first 5 rows)
+                preview_df = df.head(5)
+                preview_data = preview_df.to_dict('records')
+                
+                # Convert full dataframe to JSON
+                full_data = df.to_dict('records')
+                
+                row_count = len(df)
+                column_count = len(df.columns)
+                
+                results.append((preview_data, full_data, row_count, column_count, ""))
             
-            # Parse CSV with pandas
-            df = pd.read_csv(io.StringIO(csv_string))
-            
-            if df.empty:
-                raise HTTPException(status_code=400, detail=f"File {filename} is empty")
-            
-            # Handle NaN values by converting to None for JSON serialization
-            df = df.where(pd.notnull(df), None)
-            
-            # Get preview (first 5 rows)
-            preview_df = df.head(5)
-            preview_data = preview_df.to_dict('records')
-            
-            # Convert full dataframe to JSON
-            full_data = df.to_dict('records')
-            
-            row_count = len(df)
-            column_count = len(df.columns)
-            
-            return preview_data, full_data, row_count, column_count
+            return results
             
         except UnicodeDecodeError:
             raise HTTPException(status_code=400, detail=f"File {filename} encoding is not supported. Please use UTF-8.")
@@ -110,6 +141,89 @@ class CSVService:
     async def is_filename_already_uploaded(filename: str) -> bool:
         """Return True if a document with the given filename already exists"""
         return await CSVRepository.document_exists_by_filename(filename)
+
+    @staticmethod
+    async def _generate_metadata(document: Any, full_data: List[Dict[str, Any]]) -> None:
+        """
+        Analyze columns and generate metadata automatically.
+        Guesses data types and assigns friendly aliases.
+        """
+        if not full_data:
+            return
+
+        from app.models.csv_metadata import CSVMetadata
+        from app.repositories.csv_metadata_repository import CSVMetadataRepository
+        import datetime
+
+        # Get columns from first row
+        columns = list(full_data[0].keys())
+        
+        # Helper to guess type
+        def guess_type(val):
+            if val is None: return "string"
+            if isinstance(val, (int, float)): return "numeric"
+            if isinstance(val, str):
+                # Try to see if it looks like a date
+                if any(x in val.lower() for x in ['-', '/', ':']) and len(val) < 25:
+                     # Very loose check, could be tighter
+                     return "string" # Default to string for now unless we do strict parsing
+            return "string"
+
+        # Helper to identify target/helper columns
+        def identify_target(col_name: str, dtype: str) -> Tuple[bool, bool, str]:
+            col_lower = col_name.lower()
+            is_target = False
+            is_helper = False
+            alias = col_name.replace("_", " ").title()
+
+            # Amounts/Money are usually targets
+            if any(x in col_lower for x in ['amount', 'price', 'cost', 'total', 'balance', 'revenue', 'expense']):
+                is_target = True
+                dtype = "numeric" # Force numeric for money fields
+            
+            # Dates are targets if main date, else helper
+            elif 'date' in col_lower:
+                if col_lower in ['date', 'invoice_date', 'payment_date']:
+                    is_target = True
+                else:
+                    is_helper = True
+                dtype = "date"
+            
+            # Status, Category, Name are helpers
+            elif any(x in col_lower for x in ['status', 'category', 'type', 'name', 'customer', 'vendor']):
+                is_helper = True
+            
+            return is_target, is_helper, dtype, alias
+
+        # Create metadata entries
+        for col in columns:
+            # Check first non-null value for type guessing
+            sample_val = next((row[col] for row in full_data if row.get(col) is not None), None)
+            dtype = guess_type(sample_val)
+            
+            is_target, is_helper, dtype, alias = identify_target(col, dtype)
+            
+            # Create metadata object
+            # Note: We should ideally use a repository method, but here we construct the dict/object
+            # For simplicity, we'll use the repository to add it.
+            
+            # We need to construct the input for the repo. 
+            # Assuming CSVMetadataRepository has a create method or we use the model directly.
+            # Let's inspect CSVMetadataRepository first to be sure.
+            # BUT, since we are inside `csv_service`, we can just call the repo add method if it exists.
+            
+            # Wait, `CSVRepository` handles documents. `CSVMetadataRepository` handles metadata.
+            # Let's import it inside method to avoid circular imports if any.
+            
+            await CSVMetadataRepository.create_metadata({
+                "document_id": document.id,
+                "column_name": col,
+                "data_type": dtype,
+                "alias": alias,
+                "description": f"Automatically generated for {col}",
+                "is_target": is_target,
+                "is_helper": is_helper
+            })
     
     @staticmethod
     async def upload_csv_files(files: List[UploadFile]) -> List[CSVDocumentResponse]:
@@ -136,33 +250,38 @@ class CSVService:
                         detail=f"File {file.filename} exceeds maximum size of {settings.max_file_size / (1024*1024):.0f}MB"
                     )
                 
-                # Parse CSV content
-                preview_data, full_data, row_count, column_count = await CSVService.parse_csv_content(
-                    content, file.filename
-                )
+                # Parse content
+                parsed_results = await CSVService.parse_file_content(content, file.filename)
                 
-                # Create document data
-                document_data = CSVDocumentCreate(
-                    filename=file.filename,
-                    preview_data=preview_data,
-                    full_data=full_data,
-                    row_count=row_count,
-                    column_count=column_count
-                )
-                
-                # Save to database
-                document = await CSVRepository.create_document(document_data)
-                if document:
-                    results.append(document)
+                for preview_data, full_data, row_count, column_count, sheet_name in parsed_results:
+                    # Construct filename - append sheet name if it exists
+                    final_filename = f"{file.filename} - {sheet_name}" if sheet_name else file.filename
                     
-                    # 🔔 Notify Main Brain of new upload (non-blocking)
-                    # This triggers immediate sync instead of waiting 5 minutes
-                    asyncio.create_task(
-                        CSVService.notify_main_brain_of_new_upload(document.id, document.filename)
+                    # Create document data
+                    document_data = CSVDocumentCreate(
+                        filename=final_filename,
+                        preview_data=preview_data,
+                        full_data=full_data,
+                        row_count=row_count,
+                        column_count=column_count
                     )
-                else:
-                    raise HTTPException(status_code=500, detail=f"Failed to save {file.filename} to database")
                     
+                    # Save to database
+                    document = await CSVRepository.create_document(document_data)
+                    if document:
+                        results.append(document)
+                        
+                        # ✨ GENERATE METADATA AUTOMATICALLY ✨
+                        await CSVService._generate_metadata(document, full_data)
+
+                        # 🔔 Notify Main Brain of new upload (non-blocking)
+                        asyncio.create_task(
+                            CSVService.notify_main_brain_of_new_upload(document.id, document.filename)
+                        )
+                    else:
+                        logger.error(f"Failed to save {final_filename} to database")
+                        # Continue with other sheets/files instead of failing everything
+                        
             except HTTPException:
                 raise
             except Exception as e:
@@ -172,15 +291,19 @@ class CSVService:
         return results
     
     @staticmethod
-    async def upload_single_csv_file(file: UploadFile) -> CSVDocumentResponse:
-        """Process and upload a single CSV file"""
+    async def upload_single_csv_file(file: UploadFile) -> List[CSVDocumentResponse]:
+        """Process and upload a single file (CSV or Excel). Returns list because Excel can have multiple sheets."""
         try:
             # Validate file
             CSVService.validate_file(file)
 
             # Check for duplicate filename before processing
+            # Note: For Excel, we might want to check if any sheet-based filename exists, but that's complex.
+            # For now, we check the base filename as a simple guard, but strictly speaking, we are creating specific document names.
+            # Let's relax the strict check here or check specifically. 
+            # Current behavior checks exact filename match. 
             if await CSVService.is_filename_already_uploaded(file.filename):
-                raise HTTPException(
+                 raise HTTPException(
                     status_code=409,
                     detail=f"File '{file.filename}' has already been uploaded"
                 )
@@ -193,31 +316,42 @@ class CSVService:
                     detail=f"File {file.filename} exceeds maximum size of {settings.max_file_size / (1024*1024):.0f}MB"
                 )
             
-            # Parse CSV content
-            preview_data, full_data, row_count, column_count = await CSVService.parse_csv_content(
-                content, file.filename
-            )
-            print(full_data, "full_data")
-            # Create document data
-            document_data = CSVDocumentCreate(
-                filename=file.filename,
-                preview_data=preview_data,
-                full_data=full_data,
-                row_count=row_count,
-                column_count=column_count
-            )
+            # Parse content
+            parsed_results = await CSVService.parse_file_content(content, file.filename)
             
-            # Save to database
-            document = await CSVRepository.create_document(document_data)
-            if document:
-                # 🔔 Notify Main Brain of new upload (non-blocking)
-                # This triggers immediate sync instead of waiting 5 minutes
-                asyncio.create_task(
-                    CSVService.notify_main_brain_of_new_upload(document.id, document.filename)
+            uploaded_documents = []
+            
+            for preview_data, full_data, row_count, column_count, sheet_name in parsed_results:
+                final_filename = f"{file.filename} - {sheet_name}" if sheet_name else file.filename
+                
+                # Create document data
+                document_data = CSVDocumentCreate(
+                    filename=final_filename,
+                    preview_data=preview_data,
+                    full_data=full_data,
+                    row_count=row_count,
+                    column_count=column_count
                 )
-                return document
-            else:
-                raise HTTPException(status_code=500, detail=f"Failed to save {file.filename} to database")
+                
+                # Save to database
+                document = await CSVRepository.create_document(document_data)
+                if document:
+                    uploaded_documents.append(document)
+                    
+                    # ✨ GENERATE METADATA AUTOMATICALLY ✨
+                    await CSVService._generate_metadata(document, full_data)
+
+                    # 🔔 Notify Main Brain of new upload (non-blocking)
+                    asyncio.create_task(
+                        CSVService.notify_main_brain_of_new_upload(document.id, document.filename)
+                    )
+                else:
+                    logger.error(f"Failed to save {final_filename}")
+                    
+            if not uploaded_documents:
+                 raise HTTPException(status_code=500, detail="Failed to upload any documents from the file")
+                 
+            return uploaded_documents
                 
         except HTTPException:
             raise
