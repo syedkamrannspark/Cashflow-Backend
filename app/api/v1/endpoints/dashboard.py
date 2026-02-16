@@ -151,11 +151,11 @@ def _get_column_hints(metadata_by_doc: dict) -> str:
 
     hint = ""
     if amount_cols:
-        hint += f" For Amount, check columns: {', '.join([f"'{c}'" for c in amount_cols])}."
+        hint += " For Amount, check columns: " + ", ".join([repr(c) for c in amount_cols]) + "."
     if date_cols:
-        hint += f" For Date, check columns: {', '.join([f"'{c}'" for c in date_cols])}."
+        hint += " For Date, check columns: " + ", ".join([repr(c) for c in date_cols]) + "."
     if status_cols:
-        hint += f" For Status, check columns: {', '.join([f"'{c}'" for c in status_cols])}."
+        hint += " For Status, check columns: " + ", ".join([repr(c) for c in status_cols]) + "."
         
     return hint
 
