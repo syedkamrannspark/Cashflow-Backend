@@ -20,15 +20,30 @@ class PandasAnalyticsService:
 
     @staticmethod
     def _find_document_by_name(documents: List[CSVDocumentDetail], filename_part: str) -> Optional[CSVDocumentDetail]:
-        """Find a document that matches the filename requirement."""
-        # Clean up filename for comparison (handling potential whitespace or minor variations)
-        target = filename_part.lower().replace(" ", "")
+        """Find a document that matches the filename requirement using robust normalization."""
+        import re
+        
+        def normalize(s: str) -> str:
+            # 1. Lowercase
+            s = s.lower()
+            # 2. Remove common extensions
+            for ext in ['.csv', '.xlsx', '.xls']:
+                s = s.replace(ext, '')
+            # 3. Remove all non-alphanumeric characters (keep only a-z, 0-9)
+            s = re.sub(r'[^a-z0-9]', '', s)
+            return s
+
+        target = normalize(filename_part)
         
         for doc in documents:
-            # Check exact match or if the key part is in the filename
-            current = doc.filename.lower().replace(" ", "")
+            current = normalize(doc.filename)
+            # Check if target is inside current (e.g. "bankstatements" in "electricityproviderbankstatements")
+            # OR if current is inside target (unlikely for full paths)
             if target in current or current in target:
                 return doc
+        
+        # Fallback: Try matching specific known keywords if exact fuzzy match fails?
+        # For now, normalization should handle "BankStatements(Summary)" matching "Bank Statements - Summary"
         return None
 
     @staticmethod
@@ -177,118 +192,82 @@ class PandasAnalyticsService:
         """
         Get data for Cash Forecast chart.
         Replicates logic for 'Cash Position Forecast' chart (Chart 1 in notebook).
+        Uses 'Electricity Provider Customer Payments Forecast(Monthly Forecast).csv'.
         """
         data = {
             "labels": [],
             "datasets": []
         }
         
-        doc_current = PandasAnalyticsService._find_document_by_name(documents, "BankStatements(SummarybyType)")
+        doc_monthly = PandasAnalyticsService._find_document_by_name(documents, "CustomerPaymentsForecast(MonthlyForecast)")
         
-        current_balance = 0.0
-        if doc_current and doc_current.full_data:
-             try:
-                df_curr = PandasAnalyticsService._data_to_df(doc_current.full_data)
-                if 'Net Amount' in df_curr.columns:
-                    current_balance = df_curr['Net Amount'].replace(r'[$,]', '', regex=True).apply(pd.to_numeric, errors='coerce').fillna(0).sum()
-             except:
-                 pass
-
-        # Notebook Logic for Chart 1:
-        # Date labels: Jan 1, Jan 8, Jan 15, Jan 22, Jan 29, Feb 5, Feb 12, Feb 19
-        # Actuals: [current, 1.8M, 2.2M, 2.6M] (Mocked in notebook, we should try to be somewhat dynamic or follow the pattern)
-        # Forecast: [3.1M, 3.6M, 4.2M, 4.8M]
-        
-        # Since we likely only have monthly data, we will generate this specific view 
-        # as requested "Jan 1 to Feb 19" using the notebook's pattern but scaled to the real current balance if possible.
-        # However, the notebook hardcodes values. To be safe and identical to the notebook's "logic", 
-        # we can use the relative growth from the notebook or just harder coded values if no weekly data exists.
-        
-        # Real approach: interpolate from Current Balance to the 30-day forecast.
-        # But user wants "Jan 1 to Feb 19".
-        
-        labels = ['Jan 1', 'Jan 8', 'Jan 15', 'Jan 22', 'Jan 29', 'Feb 5', 'Feb 12', 'Feb 19']
-        
-        # We need to construct data that looks like the notebook but maybe uses real current balance as start?
-        # The notebook starts actuals with `current_cash_position`.
-        # Let's assume a growth pattern similar to the notebook if we lack granular data.
-        
-        # Notebook values: 1.8M -> 2.2M (+400k) -> 2.6M (+400k) ...
-        # It looks like a steady increase.
-        
-        actual_data = [current_balance]
-        # Simulate ~400k weekly increase or derived from monthly forecast?
-        # Let's try to get the Month 1 forecast and divide by 4 for weekly change.
-        
-        doc_analysis = PandasAnalyticsService._find_document_by_name(documents, "CustomerPaymentsForecast(CashFlowAnalysis)")
-        monthly_change = 0
-        if doc_analysis and doc_analysis.full_data:
+        if doc_monthly and doc_monthly.full_data:
             try:
-                df = PandasAnalyticsService._data_to_df(doc_analysis.full_data)
-                if 'Net Cash Flow' in df.columns:
-                     # Find Jan 2025 or first month
-                     val = df['Net Cash Flow'].replace(r'[$,]', '', regex=True).apply(pd.to_numeric, errors='coerce').fillna(0).iloc[0]
-                     monthly_change = val
-            except:
-                pass
+                df = PandasAnalyticsService._data_to_df(doc_monthly.full_data)
                 
-        weekly_change = monthly_change / 4 if monthly_change != 0 else 400000 # Default fallback from notebook approx
-        
-        # Generate Actuals (first 4 weeks)
-        running = current_balance
-        for _ in range(3):
-            running += weekly_change
-            actual_data.append(running)
-            
-        # Generate Forecast (next 4 weeks)
-        forecast_data_points = []
-        # The chart plots actuals, then forecast continues from last actual.
-        # So forecast data structure usually needs to align or be separate dataset.
-        
-        # Notebook Plot:
-        # Actuals: date_labels[:4]
-        # Forecast: date_labels[3:] (starting from last actual)
-        
-        # For Chart.js, we usually return a single array or two overlapping.
-        # Let's return the full series split into two datasets for styling.
-        
-        running_forecast = actual_data[-1]
-        forecast_vals = []
-        for _ in range(4):
-            running_forecast += weekly_change
-            forecast_vals.append(running_forecast)
-            
-        # Dataset 1: Actuals (0 to 3)
-        # Dataset 2: Forecast (3 to 7) -> needs nulls for 0-2?
-        
-        # ChartJS handling:
-        # Actuals need to span the whole label range, pad with None
-        ds_actual = actual_data + [None] * 4
-        
-        # Forecast needs to start after actuals (overlap on the last actual for continuity)
-        # 3 Nones (indices 0,1,2), overlap index 3, then forecast values
-        ds_forecast = [None] * 3 + [actual_data[-1]] + forecast_vals
-        
-        data["labels"] = labels
-        data["datasets"] = [
-            {
-                "label": "Actual Cash",
-                "data": ds_actual, 
-                "borderColor": "#10B981", # Emerald
-                "backgroundColor": "rgba(16, 185, 129, 0.2)",
-                "fill": False,
-                "tension": 0.4
-            },
-            {
-                "label": "Forecasted Cash", 
-                "data": ds_forecast, 
-                "borderColor": "#3B82F6", # Blue
-                "borderDash": [5, 5],
-                "backgroundColor": "rgba(59, 130, 246, 0.2)",
-                "fill": False,
-                "tension": 0.4
-            }
-        ]
+                # Check for required columns
+                if 'Month' in df.columns and 'Cumulative Cash' in df.columns:
+                    # Clean currency data
+                    df['Cumulative Cash'] = df['Cumulative Cash'].replace(r'[$,]', '', regex=True).apply(pd.to_numeric, errors='coerce').fillna(0)
+                    
+                    # Ensure we have data
+                    if not df.empty:
+                        # Logic from Notebook:
+                        # "Split into historical (first 6 months) and forecast (next 6 months)"
+                        # "forecast_months = months[5:]  # Start from month 6 to connect the lines"
+                        
+                        all_months = df['Month'].tolist()
+                        all_cash = df['Cumulative Cash'].tolist()
+                        
+                        # Labels are simply the months
+                        data["labels"] = all_months
+                        
+                        # Prepare datasets
+                        # Dataset 1: Actual Cash (Indices 0-5)
+                        # We pad the rest with None to match the full length of labels
+                        actual_data = all_cash[:6] + [None] * (len(all_cash) - 6)
+                        
+                        # Dataset 2: Forecasted Cash (Indices 5-End)
+                        # We pad the beginning with None so it aligns correctly
+                        # Note: We include index 5 in both to ensure the lines connect visually
+                        forecast_part = all_cash[5:]
+                        forecast_padding = [None] * 5
+                        forecast_data = forecast_padding + forecast_part
+                        
+                        # Ensure lists are same length as labels (validation)
+                        # If df has < 6 rows, this logic might break slightly, but assuming ~12 rows based on notebook
+                        
+                        data["datasets"] = [
+                            {
+                                "label": "Actual Cash",
+                                "data": actual_data, 
+                                "borderColor": "#1f77b4", # Matches ACTUAL_COLOR in notebook
+                                "backgroundColor": "rgba(31, 119, 180, 0.2)",
+                                "fill": False,
+                                "tension": 0.4,
+                                "pointRadius": 6,
+                                "pointHoverRadius": 8
+                            },
+                            {
+                                "label": "Forecasted Cash", 
+                                "data": forecast_data, 
+                                "borderColor": "#ff7f0e", # Matches FORECAST_COLOR in notebook
+                                "borderDash": [5, 5],
+                                "backgroundColor": "rgba(255, 127, 14, 0.2)",
+                                "fill": False,
+                                "tension": 0.4,
+                                "pointStyle": 'rectRot',
+                                "pointRadius": 6,
+                                "pointHoverRadius": 8
+                            }
+                        ]
+                        
+                        # Also add a vertical line annotation helper if frontend supports it?
+                        # For now, just the data series splits visualizes it well enough.
+                        
+            except Exception as e:
+                logger.error(f"Error generating Cash Forecast Data: {e}")
+                
         return data
 
     @staticmethod

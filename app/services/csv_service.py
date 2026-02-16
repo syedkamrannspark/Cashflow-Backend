@@ -297,16 +297,16 @@ class CSVService:
             # Validate file
             CSVService.validate_file(file)
 
+            is_excel = file.filename.lower().endswith(('.xlsx', '.xls'))
+
             # Check for duplicate filename before processing
-            # Note: For Excel, we might want to check if any sheet-based filename exists, but that's complex.
-            # For now, we check the base filename as a simple guard, but strictly speaking, we are creating specific document names.
-            # Let's relax the strict check here or check specifically. 
-            # Current behavior checks exact filename match. 
-            if await CSVService.is_filename_already_uploaded(file.filename):
-                 raise HTTPException(
-                    status_code=409,
-                    detail=f"File '{file.filename}' has already been uploaded"
-                )
+            # For Excel, we skip this check because the file itself isn't stored, but its sheets are.
+            if not is_excel:
+                if await CSVService.is_filename_already_uploaded(file.filename):
+                     raise HTTPException(
+                        status_code=409,
+                        detail=f"File '{file.filename}' has already been uploaded"
+                    )
             
             # Check file size
             content = await file.read()
@@ -322,8 +322,14 @@ class CSVService:
             uploaded_documents = []
             
             for preview_data, full_data, row_count, column_count, sheet_name in parsed_results:
+                # Include filename to preserve context (e.g., "Electricity Provider Bank Statements - Summary by Type")
                 final_filename = f"{file.filename} - {sheet_name}" if sheet_name else file.filename
                 
+                # Check for duplicate sheet-based filename
+                if await CSVService.is_filename_already_uploaded(final_filename):
+                    logger.warning(f"Skipping duplicate sheet upload: {final_filename}")
+                    continue
+
                 # Create document data
                 document_data = CSVDocumentCreate(
                     filename=final_filename,
@@ -349,7 +355,12 @@ class CSVService:
                     logger.error(f"Failed to save {final_filename}")
                     
             if not uploaded_documents:
-                 raise HTTPException(status_code=500, detail="Failed to upload any documents from the file")
+                 # If we skipped all because they were duplicates, that's fine, but warn user?
+                 if len(parsed_results) > 0:
+                     # Identify if it was due to duplicates
+                     raise HTTPException(status_code=409, detail="All sheets in this file have already been uploaded.")
+                 else:
+                     raise HTTPException(status_code=500, detail="Failed to upload any documents from the file")
                  
             return uploaded_documents
                 
