@@ -283,39 +283,44 @@ async def get_cash_forecast(db: Session = Depends(get_db)):
 @router.get("/insights")
 async def get_dashboard_insights(db: Session = Depends(get_db)):
     """
-    Generate AI insights based on uploaded CSV data.
-    Uses data from csv_documents and csv_metadata tables.
+    Generate AI insights for each uploaded CSV file separately.
+    Returns an array of insights, one per file.
+    Cached for 5 minutes to improve performance.
     """
     # Fetch all documents with full data
     documents = await CSVRepository.list_documents_with_full_data()
+    
+    if not documents:
+        return {"insights": []}
+    
+    # Generate cache key based on document IDs and upload dates
+    cache_key_data = {
+        "endpoint": "insights",
+        "documents": [{"id": doc.id, "upload_date": str(doc.upload_date)} for doc in documents]
+    }
+    cache_key = _generate_cache_key(cache_key_data)
+    
+    # Check cache first
+    cached_response = _get_cached_response(cache_key)
+    if cached_response is not None:
+        logger.info("Returning cached insights response")
+        return cached_response
+    
     document_ids = [doc.id for doc in documents]
     metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
 
-    # Build dataset in the same format as other endpoints
-    dataset = {
-        "documents": [
-            {
-                "id": doc.id,
-                "filename": doc.filename,
-                "row_count": doc.row_count,
-                "column_count": doc.column_count,
-                "upload_date": str(doc.upload_date),
-                "full_data": _filter_data_by_metadata(
-                    doc.full_data or [],
-                    [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper,
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                    ]
-                ),
-                "metadata": [
+    # Generate insights for each file separately
+    file_insights = []
+    
+    for doc in documents:
+        try:
+            # Get metadata for this specific document
+            doc_metadata = metadata_by_doc.get(doc.id, [])
+            
+            # Filter data for this document
+            filtered_data = _filter_data_by_metadata(
+                doc.full_data or [],
+                [
                     {
                         "column_name": meta.column_name,
                         "data_type": meta.data_type,
@@ -325,49 +330,90 @@ async def get_dashboard_insights(db: Session = Depends(get_db)):
                         "is_target": meta.is_target,
                         "is_helper": meta.is_helper,
                     }
-                    for meta in metadata_by_doc.get(doc.id, [])
-                    if meta.is_target or meta.is_helper
-                ],
-            }
-            for doc in documents
-        ]
-    }
-
-    # Use NL2SQL for insights summary using aggregated data
-    try:
-        hints = _get_column_hints(metadata_by_doc)
-        agg_query = f"Calculate total revenue, total expenses, and count of transactions grouped by Month. {hints} Use the most relevant columns."
-        nl_result = await nl2sql_agent.process_natural_query(agg_query)
-        dataset["aggregated_summary"] = nl_result.get("data_full", [])
-        
-        # Limit raw data
-        for doc in dataset["documents"]:
-            doc["full_data"] = doc["full_data"][:20] if doc["full_data"] else []
+                    for meta in doc_metadata
+                ]
+            )
             
-    except Exception as e:
-        logger.error(f"NL2SQL Error in /insights: {e}")
-        pass
-
-    # Build context from uploaded data
-    context_parts = []
-    context_parts.append(f"Total uploaded files: {len(documents)}")
+            # Build context for this specific file
+            context_parts = []
+            context_parts.append(f"Analyzing file: {doc.filename}")
+            context_parts.append(f"Total rows: {doc.row_count}, Total columns: {doc.column_count}")
+            context_parts.append(f"Upload date: {doc.upload_date}")
+            
+            # Add metadata information
+            target_helper_metadata = [m for m in doc_metadata if m.is_target or m.is_helper]
+            if target_helper_metadata:
+                context_parts.append("\nKey columns:")
+                for meta in target_helper_metadata[:10]:
+                    context_parts.append(f"  - {meta.alias or meta.column_name} ({meta.data_type}): {meta.description}")
+            
+            # Add data sample (limit to 20 rows)
+            if filtered_data:
+                context_parts.append(f"\nData sample ({min(len(filtered_data), 20)} of {len(filtered_data)} records):")
+                sample_data = filtered_data[:20]
+                
+                # Format sample data as a compact representation
+                if sample_data:
+                    # Show first 3 rows as examples
+                    context_parts.append("First 3 sample records:")
+                    for i, row in enumerate(sample_data[:3], 1):
+                        context_parts.append(f"  Record {i}: {row}")
+                    
+                    # Add analysis request
+                    context_parts.append("\nPlease provide:")
+                    context_parts.append("1. A brief description of what this data represents")
+                    context_parts.append("2. Key patterns, trends, or insights from the data")
+                    context_parts.append("3. Data quality observations")
+                    context_parts.append("4. Business recommendations based on this data")
+            
+            context = "\n".join(context_parts)
+            
+            # Generate insights for this file
+            logger.info(f"Generating insights for file: {doc.filename}")
+            insight_text = get_insights(context)
+            
+            # Try to extract description (first paragraph) and detailed analysis
+            insight_paragraphs = insight_text.split('\n\n')
+            description = insight_paragraphs[0] if insight_paragraphs else insight_text[:300]
+            detailed_analysis = '\n\n'.join(insight_paragraphs[1:]) if len(insight_paragraphs) > 1 else insight_text
+            
+            file_insights.append({
+                "file_id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "description": description,
+                "analysis": detailed_analysis,
+                "insight": insight_text,
+                "metadata_count": len(target_helper_metadata),
+                "has_target_column": any(m.is_target for m in doc_metadata),
+            })
+            
+            logger.info(f"✓ Generated insights for: {doc.filename}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate insights for {doc.filename}: {e}")
+            # Add error entry but continue with other files
+            file_insights.append({
+                "file_id": doc.id,
+                "filename": doc.filename,
+                "row_count": doc.row_count,
+                "column_count": doc.column_count,
+                "upload_date": str(doc.upload_date),
+                "insight": f"Error generating insights: {str(e)}",
+                "metadata_count": 0,
+                "has_target_column": False,
+                "error": True
+            })
     
-    for doc in dataset["documents"]:
-        context_parts.append(f"\nFile: {doc['filename']}")
-        context_parts.append(f"Rows: {doc['row_count']}, Columns: {doc['column_count']}")
-        
-        if doc['metadata']:
-            context_parts.append("Key columns:")
-            for meta in doc['metadata'][:5]:  # Show first 5 metadata columns
-                context_parts.append(f"  - {meta['alias'] or meta['column_name']}: {meta['description']}")
-        
-        # Sample data summary
-        if doc['full_data']:
-            context_parts.append(f"Data sample: {len(doc['full_data'])} records available")
+    logger.info(f"Generated insights for {len(file_insights)} files")
     
-    context = "\n".join(context_parts)
+    # Cache the response
+    response = {"insights": file_insights}
+    _set_cached_response(cache_key, response)
     
-    return {"insights": get_insights(context)}
+    return response
 
 
 @router.get("/scenario-analysis")
