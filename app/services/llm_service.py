@@ -101,6 +101,9 @@ def get_stats_from_openrouter(payload_data: dict) -> dict:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "payment stats financial metrics")
+
     system_prompt = (
         "You are a financial calculator. Your ONLY job is to return valid JSON. "
         "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
@@ -123,7 +126,7 @@ def get_stats_from_openrouter(payload_data: dict) -> dict:
 
     user_prompt = (
         "Analyze this payment data and return JSON with the 7 required metrics and breakdowns:\n\n"
-        f"{json.dumps(payload_data, default=str)}\n\n"
+        f"{json.dumps(optimized_payload, default=str)}\n\n"
         "Return ONLY this JSON structure, no markdown, no code blocks, no explanation:\n"
         "{\n"
         '  "current": <number>,\n'
@@ -281,6 +284,9 @@ def get_cash_forecast_from_openrouter(payload_data: dict) -> list:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "cash forecast position")
+
     system_prompt = (
         "You are a financial forecasting engine. Use ONLY the provided data to create an 8-point "
         "cash position series: 4 weeks of historical actuals followed by 4 weeks of future forecast. "
@@ -296,7 +302,7 @@ def get_cash_forecast_from_openrouter(payload_data: dict) -> list:
         "Generate a cash position chart series based strictly on the dataset. "
         "Provide 4 weeks of historical actual cash position followed by 4 weeks of future forecast. "
         "Return only the JSON array described above.\n\n"
-        f"DATASET_JSON:\n{json.dumps(payload_data, default=str)}"
+        f"DATASET_JSON:\n{json.dumps(optimized_payload, default=str)}"
     )
 
     payload = {
@@ -364,6 +370,9 @@ def get_data_visualization_from_openrouter(payload_data: dict) -> dict:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "visualization chart data")
+
     system_prompt = (
         "You are a data visualization expert. Your ONLY job is to return valid JSON. "
         "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
@@ -396,7 +405,7 @@ def get_data_visualization_from_openrouter(payload_data: dict) -> dict:
         "Dataset structure:\n"
         "- documents: Array of CSV files with full_data (filtered rows)\n"
         "- metadata: Column definitions with aliases, descriptions, data_types, is_target, is_helper flags\n\n"
-        f"Data:\n{json.dumps(payload_data, default=str)}\n\n"
+        f"Data:\n{json.dumps(optimized_payload, default=str)}\n\n"
         "IMPORTANT INSTRUCTIONS:\n"
         "1. Use metadata descriptions and aliases to understand what each column represents\n"
         "2. Prioritize 'is_target: true' columns for Y-axis (these are key metrics)\n"
@@ -491,6 +500,9 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "cash flow inflows outflows weekly")
+
     system_prompt = (
         "You are a financial analytics engine. Analyze the provided CSV data with metadata.\n\n"
         "TASK: Create a weekly Cash Inflows vs Outflows analysis using ACTUAL DATES from the data.\n\n"
@@ -521,7 +533,7 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
     user_prompt = (
         "Analyze this financial dataset and generate weekly Cash Inflows vs Outflows using actual dates from the data.\n\n"
         "Dataset:\n"
-        f"{json.dumps(payload_data, default=str)}\n\n"
+        f"{json.dumps(optimized_payload, default=str)}\n\n"
         "Instructions:\n"
         "1. Scan the metadata to identify date columns and inflow/outflow columns\n"
         "2. Extract actual dates from the data\n"
@@ -582,10 +594,183 @@ def get_cash_flow_from_openrouter(payload_data: dict) -> list:
         return []
 
 
+def _optimize_payload_for_llm(payload_data: dict, query: str, max_tokens: int = 6000) -> dict:
+    """
+    Intelligently reduce payload size for LLM to avoid token limit errors.
+    
+    Strategy:
+    1. Sample data intelligently based on query context
+    2. Provide comprehensive statistics for numeric columns
+    3. Include diverse representative samples
+    4. Maintain data structure for proper analysis
+    
+    Returns optimized payload with same structure but reduced data.
+    """
+    if not payload_data or "documents" not in payload_data:
+        return payload_data
+    
+    optimized = {"documents": []}
+    query_lower = query.lower()
+    
+    for doc in payload_data.get("documents", []):
+        optimized_doc = {
+            "id": doc.get("id"),
+            "filename": doc.get("filename"),
+            "row_count": doc.get("row_count"),
+            "column_count": doc.get("column_count"),
+            "upload_date": doc.get("upload_date"),
+        }
+        
+        full_data = doc.get("full_data", [])
+        
+        # If data is large, implement intelligent sampling
+        if len(full_data) > 200:
+            print(f"Optimizing payload: {len(full_data)} rows detected, sampling intelligently...")
+            
+            # Strategy 1: Identify relevant rows based on query keywords
+            relevant_rows = []
+            use_all_for_stats = True
+            
+            # Detect what type of data user is asking about
+            if any(keyword in query_lower for keyword in ["overdue", "late", "at risk", "payment status", "pending", "unpaid"]):
+                # Filter for overdue/at-risk items
+                relevant_rows = [
+                    row for row in full_data 
+                    if isinstance(row, dict) and (
+                        "overdue" in str(row).lower() or 
+                        "late" in str(row).lower() or
+                        "pending" in str(row).lower() or
+                        "unpaid" in str(row).lower()
+                    )
+                ][:100]  # Limit to 100 relevant rows
+            
+            if any(keyword in query_lower for keyword in ["highest", "largest", "biggest", "top", "maximum", "most"]):
+                # Sort and take top items
+                try:
+                    # Try to find numeric columns and sort by them
+                    numeric_rows = []
+                    for row in full_data:
+                        if isinstance(row, dict):
+                            for key, val in row.items():
+                                try:
+                                    if isinstance(val, (int, float)) and val > 0:
+                                        numeric_rows.append((float(val), row))
+                                        break
+                                except:
+                                    pass
+                    if numeric_rows:
+                        numeric_rows.sort(reverse=True, key=lambda x: x[0])
+                        relevant_rows = [row for _, row in numeric_rows[:50]]
+                except:
+                    pass
+            
+            # If we found relevant rows, combine with samples; otherwise just sample
+            if relevant_rows:
+                # Use relevant rows plus some diverse samples
+                sample_size = min(50, len(full_data) // 20)
+                sampled_indices = set()
+                
+                # Add evenly spaced samples for diversity
+                step = max(1, len(full_data) // sample_size)
+                for i in range(0, len(full_data), step):
+                    sampled_indices.add(i)
+                
+                diverse_samples = [full_data[i] for i in sorted(sampled_indices)]
+                sampled_data = relevant_rows + diverse_samples
+                print(f"Using {len(relevant_rows)} relevant rows + {len(diverse_samples)} diverse samples")
+            else:
+                # Strategy 2: Intelligent sampling - take larger sample for better analysis
+                sample_size = min(150, max(50, len(full_data) // 10))  # Increased sample size
+                
+                # Always include first and last rows (shows data range)
+                sampled_indices = {0, len(full_data) - 1}
+                
+                # Add evenly spaced samples across entire dataset
+                step = max(1, len(full_data) // sample_size)
+                for i in range(0, len(full_data), step):
+                    sampled_indices.add(i)
+                
+                # Add random samples for diversity
+                import random
+                random.seed(42)  # Consistent sampling
+                while len(sampled_indices) < sample_size:
+                    sampled_indices.add(random.randint(0, len(full_data) - 1))
+                
+                sampled_data = [full_data[i] for i in sorted(sampled_indices)]
+                print(f"Sampled {len(sampled_data)} rows from {len(full_data)} total rows")
+            
+            # Strategy 3: Add comprehensive summary statistics
+            summary = {
+                "_dataset_info": {
+                    "total_rows": len(full_data),
+                    "sampled_rows": len(sampled_data),
+                    "sampling_note": f"Showing {len(sampled_data)} representative rows from {len(full_data)} total. Statistics calculated from all {len(full_data)} rows."
+                }
+            }
+            
+            # Calculate comprehensive statistics for all numeric columns
+            if full_data and isinstance(full_data[0], dict):
+                numeric_stats = {}
+                for key in full_data[0].keys():
+                    values = []
+                    for row in full_data:
+                        try:
+                            val = float(row.get(key, 0))
+                            if val != 0:  # Only count non-zero values for meaningful stats
+                                values.append(val)
+                        except:
+                            pass
+                    
+                    if values:
+                        numeric_stats[key] = {
+                            "min": min(values),
+                            "max": max(values),
+                            "avg": round(sum(values) / len(values), 2),
+                            "sum": round(sum(values), 2),
+                            "count": len(values)
+                        }
+                
+                if numeric_stats:
+                    summary["_column_statistics"] = numeric_stats
+                
+                # Also add categorical column value distributions for better context
+                categorical_stats = {}
+                for key in full_data[0].keys():
+                    if key not in numeric_stats:  # Only for non-numeric columns
+                        value_counts = {}
+                        for row in full_data:
+                            val = str(row.get(key, ""))
+                            if val and val != "0" and val != "nan":
+                                value_counts[val] = value_counts.get(val, 0) + 1
+                        
+                        if value_counts:
+                            # Get top 10 most common values
+                            top_values = sorted(value_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+                            categorical_stats[key] = {
+                                "unique_values": len(value_counts),
+                                "top_values": [{"value": v, "count": c} for v, c in top_values]
+                            }
+                
+                if categorical_stats:
+                    summary["_categorical_distributions"] = categorical_stats
+            
+            optimized_doc["full_data"] = sampled_data
+            optimized_doc["_data_summary"] = summary
+        else:
+            # Small dataset (<=200 rows), include as is
+            optimized_doc["full_data"] = full_data
+            print(f"Including all {len(full_data)} rows (small dataset)")
+        
+        optimized["documents"].append(optimized_doc)
+    
+    return optimized
+
+
 def answer_user_query(query: str, payload_data: dict) -> str:
     """
     Answer user queries about their uploaded data and financial information.
     Uses the provided dataset to answer questions contextually.
+    Automatically optimizes context if data is large to avoid token limit errors.
     """
     if not settings.OPENROUTER_API_KEY:
         return "AI assistant is not configured. Please add your OpenRouter API key."
@@ -596,18 +781,32 @@ def answer_user_query(query: str, payload_data: dict) -> str:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, query)
+
     system_prompt = (
         "You are a helpful financial assistant. Answer user questions about their cash flow, "
-        "invoices, payment history, and financial data. Use ONLY the provided dataset to answer questions. "
-        "If the user asks about something not in the data, politely explain that you don't have that information. "
-        "Be concise, clear, and provide actionable insights when possible. "
-        "Always base your answer on the actual data provided, do not make assumptions or invent data."
+        "invoices, payment history, and financial data. Use the provided dataset to give accurate answers.\n\n"
+        "IMPORTANT CONTEXT INTERPRETATION:\n"
+        "1. When you see '_data_summary', it contains comprehensive statistics from the ENTIRE dataset\n"
+        "2. '_column_statistics' shows min/max/avg/sum/count for ALL numeric columns across all rows\n"
+        "3. '_categorical_distributions' shows value frequencies for ALL categorical columns\n"
+        "4. 'full_data' contains representative sample rows for context and patterns\n"
+        "5. The 'total_rows' field tells you the actual size of the complete dataset\n\n"
+        "HOW TO ANSWER:\n"
+        "- Use the statistics to answer aggregate questions (totals, averages, counts, etc.)\n"
+        "- Use the sample data to understand patterns, structure, and specific examples\n"
+        "- Combine both to provide accurate, comprehensive answers\n"
+        "- Always reference the actual data - be specific with numbers from the statistics\n"
+        "- If asked about totals or sums, use the '_column_statistics' sum values\n"
+        "- If asked about patterns or specific records, reference the sample data\n\n"
+        "Be concise, clear, and provide actionable insights. Do not make assumptions beyond the provided data."
     )
 
     user_prompt = (
         f"User Query: {query}\n\n"
         f"Here is the financial data available:\n"
-        f"{json.dumps(payload_data, indent=2, default=str)}"
+        f"{json.dumps(optimized_payload, indent=2, default=str)}"
     )
 
     payload = {
@@ -662,6 +861,9 @@ def get_scenario_analysis_from_openrouter(payload_data: dict) -> list:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "scenario analysis forecast optimistic pessimistic")
+
     system_prompt = (
         "You are a financial forecasting expert. Your ONLY job is to return valid JSON. "
         "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
@@ -686,7 +888,7 @@ def get_scenario_analysis_from_openrouter(payload_data: dict) -> list:
 
     user_prompt = (
         "Analyze this financial data and return a JSON array with 8 scenario forecast points:\n\n"
-        f"{json.dumps(payload_data, default=str)}\n\n"
+        f"{json.dumps(optimized_payload, default=str)}\n\n"
         "Return ONLY this JSON array structure, no markdown, no code blocks, no explanation:\n"
         "[\n"
         '  {"week": "Week 1", "optimistic": <number>, "expected": <number>, "pessimistic": <number>},\n'
@@ -776,6 +978,9 @@ def extract_invoices_from_data(payload_data: dict) -> list:
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "invoice extraction overdue at risk")
+
     system_prompt = (
         "You are a financial data extraction expert. Your ONLY job is to return valid JSON. "
         "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
@@ -798,7 +1003,7 @@ def extract_invoices_from_data(payload_data: dict) -> list:
 
     user_prompt = (
         "Extract and analyze all invoice data from this uploaded dataset:\n\n"
-        f"{json.dumps(payload_data, default=str)}\n\n"
+        f"{json.dumps(optimized_payload, default=str)}\n\n"
         "Return ONLY a JSON array, no markdown, no code blocks, no explanation:\n"
         "[\n"
         '  {\n'
@@ -897,6 +1102,9 @@ def get_dynamic_cash_flow_from_openrouter(payload_data: dict, current_balance: f
         "Content-Type": "application/json",
     }
 
+    # Optimize payload to avoid token limit errors
+    optimized_payload = _optimize_payload_for_llm(payload_data, "dynamic cash flow forecast inflows outflows")
+
     system_prompt = (
         "You are a financial analyst. Your ONLY job is to return valid JSON based STRICTLY on the provided data. "
         "Do NOT explain, do NOT use markdown, do NOT include code blocks. "
@@ -938,7 +1146,7 @@ def get_dynamic_cash_flow_from_openrouter(payload_data: dict, current_balance: f
         '  }},\n'
         "  ...\n"
         "]"
-    ).format(current_balance, json.dumps(payload_data, default=str))
+    ).format(current_balance, json.dumps(optimized_payload, default=str))
 
     payload = {
         "model": settings.LLM_MODEL,
