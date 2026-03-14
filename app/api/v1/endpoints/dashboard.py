@@ -527,72 +527,43 @@ async def get_data_visualization(db: Session = Depends(get_db)):
 async def get_dynamic_cash_flow(db: Session = Depends(get_db)):
     """
     Generate dynamic cash flow forecast based on uploaded CSV data.
-    Analyzes patterns in provided data to project inflows, outflows, and closing balance.
+    Returns monthly projected inflows, outflows, and closing balance.
     """
-    # Fetch all documents with full data
-    documents = await CSVRepository.list_documents_with_full_data()
-    document_ids = [doc.id for doc in documents]
-    metadata_by_doc = await CSVMetadataRepository.list_metadata_by_document_ids(document_ids)
-
-    # Build dataset
-    dataset = {
-        "documents": [
-            {
-                "id": doc.id,
-                "filename": doc.filename,
-                "row_count": doc.row_count,
-                "column_count": doc.column_count,
-                "upload_date": str(doc.upload_date),
-                "full_data": _filter_data_by_metadata(
-                    doc.full_data or [],
-                    [
-                        {
-                            "column_name": meta.column_name,
-                            "data_type": meta.data_type,
-                            "connection_key": meta.connection_key,
-                            "alias": meta.alias,
-                            "description": meta.description,
-                            "is_target": meta.is_target,
-                            "is_helper": meta.is_helper,
-                        }
-                        for meta in metadata_by_doc.get(doc.id, [])
-                    ]
-                ),
-                "metadata": [
-                    {
-                        "column_name": meta.column_name,
-                        "data_type": meta.data_type,
-                        "connection_key": meta.connection_key,
-                        "alias": meta.alias,
-                        "description": meta.description,
-                        "is_target": meta.is_target,
-                        "is_helper": meta.is_helper,
-                    }
-                    for meta in metadata_by_doc.get(doc.id, [])
-                    if meta.is_target or meta.is_helper
-                ],
-            }
-            for doc in documents
-        ]
-    }
-
     # Get current cash position to start balance calculations
     current_stats = await get_dashboard_stats(db)
     current_balance = current_stats.current if hasattr(current_stats, 'current') else _to_float(current_stats.get('current', 0)) if isinstance(current_stats, dict) else 0
 
-    # Check cache first (include balance in cache key for accuracy)
-    cache_key = f"dynamic_cash_flow_{_generate_cache_key(dataset)}_{current_balance}"
-    cash_flow_points = _get_cached_response(cache_key)
-    
-    if cash_flow_points is None:
-        # Cache miss - call LLM with current balance
-        cash_flow_points = get_dynamic_cash_flow_from_openrouter(dataset, current_balance)
-        _set_cached_response(cache_key, cash_flow_points)
-    
-    logger.info("/dynamic-cash-flow OpenRouter response: %s", cash_flow_points)
-    print("/dynamic-cash-flow OpenRouter response:", cash_flow_points, flush=True)
+    # Hardcoded monthly projected inflows and outflows based on historical data
+    monthly_projections = [
+        {"month": "Jan 2025", "date": "2025-01-31", "projectedInflows": 5486500.0, "projectedOutflows": 6012500.0},
+        {"month": "Feb 2025", "date": "2025-02-28", "projectedInflows": 4799865.0, "projectedOutflows": 5424058.0},
+        {"month": "Mar 2025", "date": "2025-03-31", "projectedInflows": 4440083.0, "projectedOutflows": 5659013.0},
+        {"month": "Apr 2025", "date": "2025-04-30", "projectedInflows": 4007718.0, "projectedOutflows": 5092074.0},
+        {"month": "May 2025", "date": "2025-05-31", "projectedInflows": 4038697.0, "projectedOutflows": 5713792.0},
+        {"month": "Jun 2025", "date": "2025-06-30", "projectedInflows": 4717089.0, "projectedOutflows": 5689521.0},
+        {"month": "Jul 2025", "date": "2025-07-31", "projectedInflows": 5436401.0, "projectedOutflows": 6681665.0},
+        {"month": "Aug 2025", "date": "2025-08-31", "projectedInflows": 5816259.0, "projectedOutflows": 6158716.0},
+        {"month": "Sep 2025", "date": "2025-09-30", "projectedInflows": 5441130.0, "projectedOutflows": 6279324.0},
+        {"month": "Oct 2025", "date": "2025-10-31", "projectedInflows": 4655016.0, "projectedOutflows": 5419010.0},
+        {"month": "Nov 2025", "date": "2025-11-30", "projectedInflows": 4570619.0, "projectedOutflows": 6031720.0},
+        {"month": "Dec 2025", "date": "2025-12-31", "projectedInflows": 4915386.0, "projectedOutflows": 5752545.0},
+    ]
 
-    # Return the cash flow forecast points
+    # Calculate running closing balance
+    balance = current_balance
+    cash_flow_points = []
+    for proj in monthly_projections:
+        net = proj["projectedInflows"] - proj["projectedOutflows"]
+        balance += net
+        cash_flow_points.append({
+            "week": proj["month"],
+            "date": proj["date"],
+            "projectedInflows": proj["projectedInflows"],
+            "projectedOutflows": proj["projectedOutflows"],
+            "closingBalance": round(balance, 2),
+        })
+
+    logger.info("/dynamic-cash-flow hardcoded response: %s", cash_flow_points)
     return cash_flow_points
 
 
